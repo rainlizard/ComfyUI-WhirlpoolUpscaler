@@ -99,6 +99,70 @@ def ensure_latent_dict(latent_data):
         return {"samples": latent_data}
     return latent_data
 
+def histogram_match_channel(source, reference, bins=256):
+    """Match histogram of source channel to reference channel"""
+    # Convert to 0-255 range for histogram calculation
+    source_int = (source * 255).clamp(0, 255).long()
+    reference_int = (reference * 255).clamp(0, 255).long()
+    
+    # Calculate histograms
+    source_hist = torch.histc(source_int.float(), bins=bins, min=0, max=255)
+    reference_hist = torch.histc(reference_int.float(), bins=bins, min=0, max=255)
+    
+    # Calculate CDFs (cumulative distribution functions)
+    source_cdf = torch.cumsum(source_hist, dim=0)
+    reference_cdf = torch.cumsum(reference_hist, dim=0)
+    
+    # Normalize CDFs
+    source_cdf = source_cdf / source_cdf[-1]
+    reference_cdf = reference_cdf / reference_cdf[-1]
+    
+    # Create lookup table
+    lookup_table = torch.zeros(256, device=source.device)
+    
+    for i in range(256):
+        # Find the closest CDF value in reference
+        diff = torch.abs(reference_cdf - source_cdf[i])
+        closest_idx = torch.argmin(diff)
+        lookup_table[i] = closest_idx.float()
+    
+    # Apply lookup table
+    matched = lookup_table[source_int] / 255.0
+    
+    return matched
+
+def apply_fix_vae_color(current_image, reference_image, num_samples=1000):
+    """
+    Apply histogram matching color correction to current_image based on reference_image.
+    Matches the color distribution of each RGB channel independently.
+    """
+    if reference_image is None:
+        return current_image
+    
+    batch_size, height, width, channels = current_image.shape
+    ref_height, ref_width = reference_image.shape[1], reference_image.shape[2]
+    
+    # Resize reference image to match current image size for proper comparison
+    if ref_height != height or ref_width != width:
+        reference_resized = nodes.ImageScale().upscale(reference_image, "lanczos", width, height, crop="disabled")[0]
+    else:
+        reference_resized = reference_image
+    
+    # Apply histogram matching to each channel independently
+    corrected_image = current_image.clone()
+    
+    for channel in range(3):
+        source_channel = current_image[0, :, :, channel].flatten()
+        reference_channel = reference_resized[0, :, :, channel].flatten()
+        
+        matched_channel = histogram_match_channel(source_channel, reference_channel)
+        corrected_image[0, :, :, channel] = matched_channel.view(height, width)
+    
+    # Clamp to valid range [0, 1]
+    corrected_image = torch.clamp(corrected_image, 0.0, 1.0)
+    
+    return corrected_image
+
 def vae_decode_tiled(vae, samples, use_tile=True, tile_size=512, overlap=DEFAULT_OVERLAP):
     """VAE decode with tiling support"""
     if use_tile:
@@ -123,7 +187,7 @@ def vae_encode_tiled(vae, pixels, use_tile=True, tile_size=512, overlap=DEFAULT_
         samples = nodes.VAEEncode().encode(vae, pixels)[0]
     return samples
 
-def latent_upscale_on_pixel_space(samples, resize_filter, w, h, vae, use_tile=True, tile_size=512, overlap=DEFAULT_OVERLAP):
+def latent_upscale_on_pixel_space(samples, resize_filter, w, h, vae, use_tile=True, tile_size=512, overlap=DEFAULT_OVERLAP, reference_image=None, fix_vae_color_enabled=False):
     """Latent upscaling via pixel space conversion"""
     # Ensure samples is in the proper format for VAE decode
     samples_dict = ensure_latent_dict(samples)
@@ -134,7 +198,11 @@ def latent_upscale_on_pixel_space(samples, resize_filter, w, h, vae, use_tile=Tr
     # Step 2: Image upscale
     pixels = nodes.ImageScale().upscale(pixels, resize_filter, int(w), int(h), False)[0]
     
-    # Step 3: VAE encode  
+    # Step 3: Apply color correction if enabled (after upscaling, before VAE encode)
+    if fix_vae_color_enabled and reference_image is not None:
+        pixels = apply_fix_vae_color(pixels, reference_image)
+    
+    # Step 4: VAE encode  
     upscaled_latent = vae_encode_tiled(vae, pixels, use_tile, tile_size, overlap)
     
     return upscaled_latent, pixels
@@ -165,7 +233,7 @@ def lanczos_upscale(image, resize_filter="lanczos", target_height=None, target_w
     return upscaled
 
 
-def common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sampler_name, scheduler, positive, negative, image, denoise_start=1.0, vae=None, iterations=4, denoise_end=0.05, upscale_by=1.0, resize_filter="lanczos", upscale_curve=1.0, tile_size=512, add_noise=0.0):
+def common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sampler_name, scheduler, positive, negative, image, denoise_start=1.0, vae=None, iterations=4, denoise_end=0.05, upscale_by=1.0, resize_filter="lanczos", upscale_curve=1.0, tile_size=512, add_noise=0.0, fix_vae_color=False):
     # Ensure image is in [B, H, W, C] format
     if len(image.shape) == 4 and image.shape[1] in [1, 3]:
         image = image.permute(0, 2, 3, 1)
@@ -258,6 +326,9 @@ def common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sam
     original_latent = vae_encode_tiled(vae, image, use_tile=True, tile_size=tile_size, overlap=DEFAULT_OVERLAP)
     current_latent = original_latent
     
+    # For color correction tracking - always use original image as reference
+    reference_image = image if fix_vae_color else None
+    
     for iteration in range(iterations):
         current_denoise = denoise_values[iteration]
         current_cfg = cfg_values[iteration]
@@ -291,7 +362,8 @@ def common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sam
             # STEP 1: Latent upscaling via pixel space
             upscaled_latent, upscaled_pixels = latent_upscale_on_pixel_space(
                 current_latent, resize_filter, target_width, target_height, vae, 
-                use_tile=True, tile_size=tile_size, overlap=DEFAULT_OVERLAP
+                use_tile=True, tile_size=tile_size, overlap=DEFAULT_OVERLAP,
+                reference_image=reference_image, fix_vae_color_enabled=fix_vae_color
             )
             
             # STEP 2: Sampling
@@ -368,12 +440,22 @@ def common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sam
     # Final decode: Convert final latent back to image space
     try:
         final_image = vae_decode_tiled(vae, current_latent, use_tile=True, tile_size=tile_size, overlap=DEFAULT_OVERLAP)
+        
+        # Apply final color correction to the output image
+        if fix_vae_color and reference_image is not None:
+            final_image = apply_fix_vae_color(final_image, reference_image)
+        
         return final_image
     except Exception as e:
         print(f"Final decode failed: {e}, using fallback decode")
         try:
             # Fallback to simpler decode
             final_image = vae_decode_tiled(vae, current_latent, use_tile=False)
+            
+            # Apply final color correction to fallback image too
+            if fix_vae_color and reference_image is not None:
+                final_image = apply_fix_vae_color(final_image, reference_image)
+            
             return final_image
         except Exception as e2:
             print(f"All decode methods failed: {e2}, returning black image")
@@ -408,6 +490,7 @@ class WhirlpoolUpscaler:
                 "tile_size": ("INT", {"default": 1024, "min": 320, "max": 2048, "step": 64, "tooltip": "Tile size for VAE operations."}),
                 "vae": ("VAE", ),
                 "add_noise": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 100.0, "step": 0.1, "tooltip": "Adds noise before denoising each iteration. The amount added is relative to the current denoise."}),
+                "fix_vae_color": ("BOOLEAN", {"default": True, "tooltip": "Apply color correction after each iteration to maintain color consistency with the original image."}),
             },
         }
 
@@ -417,8 +500,8 @@ class WhirlpoolUpscaler:
 
     CATEGORY = "Whirlpool Upscaler"
 
-    def sample(self, model, seed, iterations, steps_start, steps_end, cfg_start, cfg_end, sampler_name, scheduler, positive, negative, image, denoise_start=1.0, denoise_end=1.0, add_noise=0.0, upscale_by=1.0, resize_filter="lanczos", upscale_curve=1.0, tile_size=512, vae=None):
-        image_out = common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sampler_name, scheduler, positive, negative, image, denoise_start=denoise_start, vae=vae, iterations=iterations, denoise_end=denoise_end, upscale_by=upscale_by, resize_filter=resize_filter, upscale_curve=upscale_curve, tile_size=tile_size, add_noise=add_noise)
+    def sample(self, model, seed, iterations, steps_start, steps_end, cfg_start, cfg_end, sampler_name, scheduler, positive, negative, image, denoise_start=1.0, denoise_end=1.0, add_noise=0.0, fix_vae_color=False, upscale_by=1.0, resize_filter="lanczos", upscale_curve=1.0, tile_size=512, vae=None):
+        image_out = common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sampler_name, scheduler, positive, negative, image, denoise_start=denoise_start, vae=vae, iterations=iterations, denoise_end=denoise_end, upscale_by=upscale_by, resize_filter=resize_filter, upscale_curve=upscale_curve, tile_size=tile_size, add_noise=add_noise, fix_vae_color=fix_vae_color)
         
         if image_out is None:
             # Create a black image if everything fails
