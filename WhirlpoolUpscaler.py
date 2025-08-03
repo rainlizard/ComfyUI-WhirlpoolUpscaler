@@ -99,13 +99,13 @@ def ensure_latent_dict(latent_data):
         return {"samples": latent_data}
     return latent_data
 
-def upscale_with_model(upscale_model, image):
+def upscale_with_model(upscale_model, image, tile_size=512):
     """Upscale image using an AI upscale model - equivalent to ImageUpscaleWithModel"""
     device = model_management.get_torch_device()
     upscale_model.to(device)
     in_img = image.movedim(-1,-3).to(device)
     
-    tile = 512
+    tile = tile_size
     overlap = 32
     
     oom = True
@@ -229,7 +229,7 @@ def latent_upscale_on_pixel_space(samples, resize_filter, w, h, vae, use_tile=Tr
         
         # Apply model upscaling iteratively until we reach or exceed target size
         while current_w < target_w or current_h < target_h:
-            pixels = upscale_with_model(upscale_model, pixels)
+            pixels = upscale_with_model(upscale_model, pixels, tile_size)
             new_w = pixels.shape[2]
             new_h = pixels.shape[1]
             
