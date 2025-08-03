@@ -5,6 +5,7 @@ from comfy import model_management
 import nodes
 import inspect
 import math
+import time
 
 
 # Use ComfyUI's native sampling only
@@ -17,8 +18,25 @@ except ImportError:
     COMFY_INTERRUPT_AVAILABLE = False
 
 # Constants
+PRINT_DEBUG_MESSAGES = True
 LATENT_TO_PIXEL_SCALE = 8
 DEFAULT_OVERLAP = 64
+
+# Global timer for debug messages
+_debug_start_time = None
+
+def get_debug_time():
+    """Get elapsed time in milliseconds since debug timer started"""
+    global _debug_start_time
+    if _debug_start_time is None:
+        _debug_start_time = time.time()
+        return 0
+    return int((time.time() - _debug_start_time) * 1000)
+
+def reset_debug_timer():
+    """Reset the debug timer"""
+    global _debug_start_time
+    _debug_start_time = time.time()
 
 # WhirlpoolUpscaler: Progressive Multi-Iteration Sampling with Upscaling
 # 
@@ -101,6 +119,9 @@ def ensure_latent_dict(latent_data):
 
 def upscale_with_model(upscale_model, image, tile_size=512):
     """Upscale image using an AI upscale model - equivalent to ImageUpscaleWithModel"""
+    if PRINT_DEBUG_MESSAGES:
+        print(f"[WhirlpoolUpscaler DEBUG] Model Upscale: input shape {image.shape}, tile_size={tile_size}, model_scale={upscale_model.scale} [{get_debug_time()}ms]")
+    
     device = model_management.get_torch_device()
     upscale_model.to(device)
     in_img = image.movedim(-1,-3).to(device)
@@ -116,11 +137,17 @@ def upscale_with_model(upscale_model, image, tile_size=512):
             s = comfy.utils.tiled_scale(in_img, lambda a: upscale_model(a), tile_x=tile, tile_y=tile, overlap=overlap, upscale_amount=upscale_model.scale, pbar=pbar)
             oom = False
         except model_management.OOM_EXCEPTION as e:
+            if PRINT_DEBUG_MESSAGES:
+                print(f"[WhirlpoolUpscaler DEBUG] Model Upscale OOM, reducing tile size from {tile} to {tile//2} [{get_debug_time()}ms]")
             tile //= 2
             if tile < 128:
                 raise e
 
     s = torch.clamp(s.movedim(-3,-1), min=0, max=1.0)
+    
+    if PRINT_DEBUG_MESSAGES:
+        print(f"[WhirlpoolUpscaler DEBUG] Model Upscale complete: output shape {s.shape} [{get_debug_time()}ms]")
+    
     return s
 
 def histogram_match_channel(source, reference, bins=256):
@@ -163,11 +190,16 @@ def apply_fix_vae_color(current_image, reference_image, num_samples=1000):
     if reference_image is None:
         return current_image
     
+    if PRINT_DEBUG_MESSAGES:
+        print(f"[WhirlpoolUpscaler DEBUG] Color Correction: current shape {current_image.shape}, reference shape {reference_image.shape} [{get_debug_time()}ms]")
+    
     batch_size, height, width, channels = current_image.shape
     ref_height, ref_width = reference_image.shape[1], reference_image.shape[2]
     
     # Resize reference image to match current image size for proper comparison
     if ref_height != height or ref_width != width:
+        if PRINT_DEBUG_MESSAGES:
+            print(f"[WhirlpoolUpscaler DEBUG] Color Correction: resizing reference from {ref_width}x{ref_height} to {width}x{height} [{get_debug_time()}ms]")
         reference_resized = nodes.ImageScale().upscale(reference_image, "lanczos", width, height, crop="disabled")[0]
     else:
         reference_resized = reference_image
@@ -185,10 +217,16 @@ def apply_fix_vae_color(current_image, reference_image, num_samples=1000):
     # Clamp to valid range [0, 1]
     corrected_image = torch.clamp(corrected_image, 0.0, 1.0)
     
+    if PRINT_DEBUG_MESSAGES:
+        print(f"[WhirlpoolUpscaler DEBUG] Color Correction complete [{get_debug_time()}ms]")
+    
     return corrected_image
 
 def vae_decode_tiled(vae, samples, use_tile=True, tile_size=512, overlap=DEFAULT_OVERLAP):
     """VAE decode with tiling support"""
+    if PRINT_DEBUG_MESSAGES:
+        print(f"[WhirlpoolUpscaler DEBUG] VAE Decode: use_tile={use_tile}, tile_size={tile_size} [{get_debug_time()}ms]")
+    
     if use_tile:
         decoder = nodes.VAEDecodeTiled()
         if 'overlap' in inspect.signature(decoder.decode).parameters:
@@ -197,10 +235,17 @@ def vae_decode_tiled(vae, samples, use_tile=True, tile_size=512, overlap=DEFAULT
             pixels = decoder.decode(vae, samples, tile_size)[0]
     else:
         pixels = nodes.VAEDecode().decode(vae, samples)[0]
+    
+    if PRINT_DEBUG_MESSAGES:
+        print(f"[WhirlpoolUpscaler DEBUG] VAE Decode complete: output shape {pixels.shape} [{get_debug_time()}ms]")
+    
     return pixels
 
 def vae_encode_tiled(vae, pixels, use_tile=True, tile_size=512, overlap=DEFAULT_OVERLAP):
     """VAE encode with tiling support"""
+    if PRINT_DEBUG_MESSAGES:
+        print(f"[WhirlpoolUpscaler DEBUG] VAE Encode: input shape {pixels.shape}, use_tile={use_tile}, tile_size={tile_size} [{get_debug_time()}ms]")
+    
     if use_tile:
         encoder = nodes.VAEEncodeTiled()
         if 'overlap' in inspect.signature(encoder.encode).parameters:
@@ -209,6 +254,11 @@ def vae_encode_tiled(vae, pixels, use_tile=True, tile_size=512, overlap=DEFAULT_
             samples = encoder.encode(vae, pixels, tile_size)[0]
     else:
         samples = nodes.VAEEncode().encode(vae, pixels)[0]
+    
+    if PRINT_DEBUG_MESSAGES:
+        samples_tensor = extract_latent_tensor(samples)
+        print(f"[WhirlpoolUpscaler DEBUG] VAE Encode complete: output shape {samples_tensor.shape} [{get_debug_time()}ms]")
+    
     return samples
 
 def latent_upscale_on_pixel_space(samples, resize_filter, w, h, vae, use_tile=True, tile_size=512, overlap=DEFAULT_OVERLAP, reference_image=None, fix_vae_color_enabled=False, upscale_model=None):
@@ -235,7 +285,10 @@ def latent_upscale_on_pixel_space(samples, resize_filter, w, h, vae, use_tile=Tr
             
             # Check if model didn't actually upscale (1x model)
             if new_w == current_w and new_h == current_h:
-                print(f"[WhirlpoolUpscaler] 1x upscale model detected, breaking upscale loop")
+                if PRINT_DEBUG_MESSAGES:
+                    print(f"[WhirlpoolUpscaler DEBUG] 1x upscale model detected, breaking upscale loop [{get_debug_time()}ms]")
+                else:
+                    print(f"[WhirlpoolUpscaler] 1x upscale model detected, breaking upscale loop")
                 break
             
             current_w = new_w
@@ -264,6 +317,9 @@ def lanczos_upscale(image, resize_filter="lanczos", target_height=None, target_w
     if scale_factor == 1.0 and target_height is None and target_width is None:
         return image
     
+    if PRINT_DEBUG_MESSAGES:
+        print(f"[WhirlpoolUpscaler DEBUG] Image Resize: input shape {image.shape}, filter={resize_filter}, scale_factor={scale_factor} [{get_debug_time()}ms]")
+    
     # Ensure image is in [B, H, W, C] format for ImageScale
     if len(image.shape) == 4 and image.shape[1] in [1, 3]:
         image = image.permute(0, 2, 3, 1)
@@ -277,23 +333,37 @@ def lanczos_upscale(image, resize_filter="lanczos", target_height=None, target_w
         new_height = int(height * scale_factor)
         new_width = int(width * scale_factor)
     
+    if PRINT_DEBUG_MESSAGES:
+        print(f"[WhirlpoolUpscaler DEBUG] Image Resize: {width}x{height} -> {new_width}x{new_height} [{get_debug_time()}ms]")
+    
     # Use ComfyUI's native ImageScale node for proper Lanczos upscaling
     upscaled = nodes.ImageScale().upscale(image, resize_filter, new_width, new_height, crop="disabled")[0]
+    
+    if PRINT_DEBUG_MESSAGES:
+        print(f"[WhirlpoolUpscaler DEBUG] Image Resize complete: output shape {upscaled.shape} [{get_debug_time()}ms]")
     
     return upscaled
 
 
 def common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sampler_name, scheduler, positive, negative, image, denoise_start=1.0, vae=None, iterations=4, denoise_end=0.05, upscale_by=1.0, resize_filter="lanczos", upscale_curve=1.0, tile_size=512, add_noise=0.0, fix_vae_color=False, upscale_model=None):
+    if PRINT_DEBUG_MESSAGES:
+        reset_debug_timer()  # Reset timer at start of process
+        print(f"[WhirlpoolUpscaler DEBUG] Starting upscaling process: iterations={iterations}, upscale_by={upscale_by}x, steps={steps_start}->{steps_end}, cfg={cfg_start}->{cfg_end}, denoise={denoise_start}->{denoise_end} [{get_debug_time()}ms]")
+    
     # Ensure image is in [B, H, W, C] format
     if len(image.shape) == 4 and image.shape[1] in [1, 3]:
         image = image.permute(0, 2, 3, 1)
     
     # If iterations is 0, return original image unchanged
     if iterations == 0:
+        if PRINT_DEBUG_MESSAGES:
+            print(f"[WhirlpoolUpscaler DEBUG] Zero iterations, returning original image [{get_debug_time()}ms]")
         return image
     
     # If VAE is not provided, use simple upscaling
     if vae is None:
+        if PRINT_DEBUG_MESSAGES:
+            print(f"[WhirlpoolUpscaler DEBUG] No VAE provided, using basic image upscaling [{get_debug_time()}ms]")
         # For no VAE, just do simple upscaling
         target_width = int(image.shape[2] * upscale_by)
         target_height = int(image.shape[1] * upscale_by)
@@ -373,6 +443,8 @@ def common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sam
     
     # Encode original image to latent space once
     # This preserves the original image characteristics throughout iterations
+    if PRINT_DEBUG_MESSAGES:
+        print(f"[WhirlpoolUpscaler DEBUG] Encoding original image to latent space [{get_debug_time()}ms]")
     original_latent = vae_encode_tiled(vae, image, use_tile=True, tile_size=tile_size, overlap=DEFAULT_OVERLAP)
     current_latent = original_latent
     
@@ -423,9 +495,14 @@ def common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sam
             
             # Add noise before denoising if noise level > 0
             if current_noise > 0.0:
+                if PRINT_DEBUG_MESSAGES:
+                    print(f"[WhirlpoolUpscaler DEBUG] Adding noise: {current_noise:.3f} [{get_debug_time()}ms]")
                 # Generate noise tensor with same shape as latent
                 additional_noise = torch.randn_like(latent_tensor) * current_noise
                 latent_tensor = latent_tensor + additional_noise
+            
+            if PRINT_DEBUG_MESSAGES:
+                print(f"[WhirlpoolUpscaler DEBUG] Sampling: {current_steps} steps, {current_cfg} CFG, {current_denoise:.3f} denoise, sampler={sampler_name} [{get_debug_time()}ms]")
             
             noise = comfy.sample.prepare_noise(latent_tensor, current_seed, None)
             
@@ -435,6 +512,9 @@ def common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sam
                 force_full_denoise=True, noise_mask=None, seed=current_seed
             )
             refined_latent = ensure_latent_dict(refined_samples)
+            
+            if PRINT_DEBUG_MESSAGES:
+                print(f"[WhirlpoolUpscaler DEBUG] Sampling complete for iteration {iteration + 1} [{get_debug_time()}ms]")
             
             # STEP 3: Update current latent for next iteration
             current_latent = refined_latent
@@ -489,13 +569,19 @@ def common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sam
         
 
     # Final decode: Convert final latent back to image space
+    if PRINT_DEBUG_MESSAGES:
+        print(f"[WhirlpoolUpscaler DEBUG] Final decode: converting latent to image [{get_debug_time()}ms]")
     try:
         final_image = vae_decode_tiled(vae, current_latent, use_tile=True, tile_size=tile_size, overlap=DEFAULT_OVERLAP)
         
         # Apply final color correction to the output image
         if fix_vae_color and reference_image is not None:
+            if PRINT_DEBUG_MESSAGES:
+                print(f"[WhirlpoolUpscaler DEBUG] Applying final color correction [{get_debug_time()}ms]")
             final_image = apply_fix_vae_color(final_image, reference_image)
         
+        if PRINT_DEBUG_MESSAGES:
+            print(f"[WhirlpoolUpscaler DEBUG] Upscaling process complete: final shape {final_image.shape} [{get_debug_time()}ms]")
         return final_image
     except Exception as e:
         print(f"Final decode failed: {e}, using fallback decode")
