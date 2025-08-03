@@ -120,7 +120,6 @@ def upscale_with_model(upscale_model, image):
             if tile < 128:
                 raise e
 
-    upscale_model.cpu()
     s = torch.clamp(s.movedim(-3,-1), min=0, max=1.0)
     return s
 
@@ -284,7 +283,7 @@ def lanczos_upscale(image, resize_filter="lanczos", target_height=None, target_w
     return upscaled
 
 
-def common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sampler_name, scheduler, positive, negative, image, denoise_start=1.0, vae=None, iterations=4, denoise_end=0.05, upscale_by=1.0, resize_filter="lanczos", upscale_curve=1.0, tile_size=512, add_noise=0.0, fix_vae_color=False, upscale_model_opt=None):
+def common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sampler_name, scheduler, positive, negative, image, denoise_start=1.0, vae=None, iterations=4, denoise_end=0.05, upscale_by=1.0, resize_filter="lanczos", upscale_curve=1.0, tile_size=512, add_noise=0.0, fix_vae_color=False, upscale_model=None):
     # Ensure image is in [B, H, W, C] format
     if len(image.shape) == 4 and image.shape[1] in [1, 3]:
         image = image.permute(0, 2, 3, 1)
@@ -415,7 +414,7 @@ def common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sam
                 current_latent, resize_filter, target_width, target_height, vae, 
                 use_tile=True, tile_size=tile_size, overlap=DEFAULT_OVERLAP,
                 reference_image=reference_image, fix_vae_color_enabled=fix_vae_color,
-                upscale_model=upscale_model_opt
+                upscale_model=upscale_model
             )
             
             # STEP 2: Sampling
@@ -530,22 +529,22 @@ class WhirlpoolUpscaler:
                 "iterations": ("INT", {"default": 4, "min": 0, "max": 20, "tooltip": "Number of complete sampling cycles to perform."}),
                 "steps_start": ("INT", {"default": 24, "min": 1, "max": 10000, "tooltip": "Number of sampling steps for the first iteration."}),
                 "steps_end": ("INT", {"default": 2, "min": 1, "max": 10000, "tooltip": "Number of sampling steps for the last iteration."}),
-                "cfg_start": ("FLOAT", {"default": 20.0, "min": 0.0, "max": 10000.0, "step": 0.1, "round": 0.01, "tooltip": "CFG scale for the first iteration."}),
+                "cfg_start": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10000.0, "step": 0.1, "round": 0.01, "tooltip": "CFG scale for the first iteration."}),
                 "cfg_end": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10000.0, "step": 0.1, "round": 0.01, "tooltip": "CFG scale for the last iteration."}),
-                "denoise_start": ("FLOAT", {"default": 0.20, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Denoise strength for the first iteration."}),
+                "denoise_start": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Denoise strength for the first iteration."}),
                 "denoise_end": ("FLOAT", {"default": 0.05, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Denoise strength for the last iteration."}),
-                "sampler_name": (comfy.samplers.KSampler.SAMPLERS, {"default": "euler_ancestral"}),
-                "scheduler": (comfy.samplers.KSampler.SCHEDULERS, {"default": "sgm_uniform"}),
+                "add_noise": ("FLOAT", {"default": 4.0, "min": 0.0, "max": 100.0, "step": 0.1, "tooltip": "Adds noise before denoising each iteration. The amount added is relative to the current denoise."}),
+                "fix_vae_color": ("BOOLEAN", {"default": True, "tooltip": "Apply color correction after each iteration to maintain color consistency with the original image."}),
+                "sampler_name": (comfy.samplers.KSampler.SAMPLERS, {"default": "euler"}),
+                "scheduler": (comfy.samplers.KSampler.SCHEDULERS, {"default": "simple"}),
                 "positive": ("CONDITIONING", ),
                 "negative": ("CONDITIONING", ),
                 "resize_filter": (["lanczos", "nearest-exact", "bilinear", "area", "bicubic"], {"default": "lanczos", "tooltip": "Image resizing filter algorithm."}),
                 "tile_size": ("INT", {"default": 1024, "min": 320, "max": 2048, "step": 64, "tooltip": "Tile size for VAE operations."}),
                 "vae": ("VAE", ),
-                "add_noise": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 100.0, "step": 0.1, "tooltip": "Adds noise before denoising each iteration. The amount added is relative to the current denoise."}),
-                "fix_vae_color": ("BOOLEAN", {"default": True, "tooltip": "Apply color correction after each iteration to maintain color consistency with the original image."}),
             },
             "optional": {
-                "upscale_model_opt": ("UPSCALE_MODEL", {"tooltip": "Optional AI upscaling model (e.g., ESRGAN, Real-ESRGAN) for enhanced image quality during upscaling."}),
+                "upscale_model": ("UPSCALE_MODEL", {"tooltip": "Optional AI upscaling model (e.g., ESRGAN, Real-ESRGAN) for enhanced image quality during upscaling."}),
             },
         }
 
@@ -555,8 +554,8 @@ class WhirlpoolUpscaler:
 
     CATEGORY = "Whirlpool Upscaler"
 
-    def sample(self, model, seed, iterations, steps_start, steps_end, cfg_start, cfg_end, sampler_name, scheduler, positive, negative, image, denoise_start=1.0, denoise_end=1.0, add_noise=0.0, fix_vae_color=False, upscale_by=1.0, resize_filter="lanczos", upscale_curve=1.0, tile_size=512, vae=None, upscale_model_opt=None):
-        image_out = common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sampler_name, scheduler, positive, negative, image, denoise_start=denoise_start, vae=vae, iterations=iterations, denoise_end=denoise_end, upscale_by=upscale_by, resize_filter=resize_filter, upscale_curve=upscale_curve, tile_size=tile_size, add_noise=add_noise, fix_vae_color=fix_vae_color, upscale_model_opt=upscale_model_opt)
+    def sample(self, model, seed, iterations, steps_start, steps_end, cfg_start, cfg_end, sampler_name, scheduler, positive, negative, image, denoise_start=1.0, denoise_end=1.0, add_noise=0.0, fix_vae_color=False, upscale_by=1.0, resize_filter="lanczos", upscale_curve=1.0, tile_size=512, vae=None, upscale_model=None):
+        image_out = common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sampler_name, scheduler, positive, negative, image, denoise_start=denoise_start, vae=vae, iterations=iterations, denoise_end=denoise_end, upscale_by=upscale_by, resize_filter=resize_filter, upscale_curve=upscale_curve, tile_size=tile_size, add_noise=add_noise, fix_vae_color=fix_vae_color, upscale_model=upscale_model)
         
         if image_out is None:
             # Create a black image if everything fails
