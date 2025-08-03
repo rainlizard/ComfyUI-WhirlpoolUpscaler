@@ -165,7 +165,7 @@ def lanczos_upscale(image, resize_filter="lanczos", target_height=None, target_w
     return upscaled
 
 
-def common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sampler_name, scheduler, positive, negative, image, denoise_start=1.0, vae=None, iterations=4, denoise_end=0.05, upscale_by=1.0, resize_filter="lanczos", upscale_curve=1.0, tile_size=512):
+def common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sampler_name, scheduler, positive, negative, image, denoise_start=1.0, vae=None, iterations=4, denoise_end=0.05, upscale_by=1.0, resize_filter="lanczos", upscale_curve=1.0, tile_size=512, add_noise=0.0):
     # Ensure image is in [B, H, W, C] format
     if len(image.shape) == 4 and image.shape[1] in [1, 3]:
         image = image.permute(0, 2, 3, 1)
@@ -250,6 +250,7 @@ def common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sam
             current_cfg = cfg_start + curved_t * (cfg_end - cfg_start)
             cfg_values.append(current_cfg)
     
+    
     current_seed = seed
     
     # Encode original image to latent space once
@@ -261,6 +262,8 @@ def common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sam
         current_denoise = denoise_values[iteration]
         current_cfg = cfg_values[iteration]
         current_steps = steps_values[iteration]
+        # Calculate noise as multiplier of current denoise value
+        current_noise = current_denoise * add_noise
         
         # Get current and target resolutions for logging (from latent dimensions)
         # Extract tensor from latent dict for shape calculation
@@ -274,7 +277,10 @@ def common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sam
         target_height = int(original_height * current_scale)
         
         # Log iteration information
-        print(f"[WhirlpoolUpscaler] Iteration {iteration + 1}/{iterations} | Current: {current_width}x{current_height} | Target: {target_width}x{target_height} | Scale: {current_scale:.3f}x | Denoise: {current_denoise:.3f} | Steps: {current_steps} | CFG: {current_cfg:.1f}")
+        if add_noise > 0.0:
+            print(f"[WhirlpoolUpscaler] Iteration {iteration + 1}/{iterations} | Current: {current_width}x{current_height} | Target: {target_width}x{target_height} | Scale: {current_scale:.3f}x | Denoise: {current_denoise:.3f} | Steps: {current_steps} | CFG: {current_cfg:.1f} | Add Noise: {current_noise:.3f} (×{add_noise})")
+        else:
+            print(f"[WhirlpoolUpscaler] Iteration {iteration + 1}/{iterations} | Current: {current_width}x{current_height} | Target: {target_width}x{target_height} | Scale: {current_scale:.3f}x | Denoise: {current_denoise:.3f} | Steps: {current_steps} | CFG: {current_cfg:.1f}")
         
         try:
             # Upscale and sample method
@@ -291,6 +297,13 @@ def common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sam
             # STEP 2: Sampling
             
             latent_tensor = extract_latent_tensor(upscaled_latent)
+            
+            # Add noise before denoising if noise level > 0
+            if current_noise > 0.0:
+                # Generate noise tensor with same shape as latent
+                additional_noise = torch.randn_like(latent_tensor) * current_noise
+                latent_tensor = latent_tensor + additional_noise
+            
             noise = comfy.sample.prepare_noise(latent_tensor, current_seed, None)
             
             refined_samples = comfy.sample.sample(
@@ -379,13 +392,13 @@ class WhirlpoolUpscaler:
                 "model": ("MODEL",),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
                 "upscale_by": ("FLOAT", {"default": 2.00, "min": 0.1, "max": 10000, "step": 0.01, "tooltip": "Final resolution multiplier (e.g., 2.0 = double width and height)."}),
-                "upscale_curve": ("FLOAT", {"default": 2.00, "min": 1.0, "max": 10.0, "step": 0.01, "tooltip": "Progression curve for all parameters (resolution, CFG, steps, denoise). 1.0 = linear progression, >1.0 = exponential progression (higher values = more exponential)."}),
+                "upscale_curve": ("FLOAT", {"default": 1.75, "min": 1.0, "max": 10.0, "step": 0.01, "tooltip": "Progression curve for all parameters (resolution, CFG, steps, denoise). 1.0 = linear progression, >1.0 = exponential progression (higher values = more exponential)."}),
                 "iterations": ("INT", {"default": 4, "min": 0, "max": 20, "tooltip": "Number of complete sampling cycles to perform."}),
                 "steps_start": ("INT", {"default": 24, "min": 1, "max": 10000, "tooltip": "Number of sampling steps for the first iteration."}),
                 "steps_end": ("INT", {"default": 2, "min": 1, "max": 10000, "tooltip": "Number of sampling steps for the last iteration."}),
                 "cfg_start": ("FLOAT", {"default": 20.0, "min": 0.0, "max": 10000.0, "step": 0.1, "round": 0.01, "tooltip": "CFG scale for the first iteration."}),
                 "cfg_end": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10000.0, "step": 0.1, "round": 0.01, "tooltip": "CFG scale for the last iteration."}),
-                "denoise_start": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Denoise strength for the first iteration."}),
+                "denoise_start": ("FLOAT", {"default": 0.20, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Denoise strength for the first iteration."}),
                 "denoise_end": ("FLOAT", {"default": 0.05, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Denoise strength for the last iteration."}),
                 "sampler_name": (comfy.samplers.KSampler.SAMPLERS, {"default": "euler_ancestral"}),
                 "scheduler": (comfy.samplers.KSampler.SCHEDULERS, {"default": "sgm_uniform"}),
@@ -394,6 +407,7 @@ class WhirlpoolUpscaler:
                 "resize_filter": (["lanczos", "nearest-exact", "bilinear", "area", "bicubic"], {"default": "lanczos", "tooltip": "Image resizing filter algorithm."}),
                 "tile_size": ("INT", {"default": 1024, "min": 320, "max": 2048, "step": 64, "tooltip": "Tile size for VAE operations."}),
                 "vae": ("VAE", ),
+                "add_noise": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 100.0, "step": 0.1, "tooltip": "Adds noise before denoising each iteration. The amount added is relative to the current denoise."}),
             },
         }
 
@@ -403,8 +417,8 @@ class WhirlpoolUpscaler:
 
     CATEGORY = "Whirlpool Upscaler"
 
-    def sample(self, model, seed, iterations, steps_start, steps_end, cfg_start, cfg_end, sampler_name, scheduler, positive, negative, image, denoise_start=1.0, denoise_end=1.0, upscale_by=1.0, resize_filter="lanczos", upscale_curve=1.0, tile_size=512, vae=None):
-        image_out = common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sampler_name, scheduler, positive, negative, image, denoise_start=denoise_start, vae=vae, iterations=iterations, denoise_end=denoise_end, upscale_by=upscale_by, resize_filter=resize_filter, upscale_curve=upscale_curve, tile_size=tile_size)
+    def sample(self, model, seed, iterations, steps_start, steps_end, cfg_start, cfg_end, sampler_name, scheduler, positive, negative, image, denoise_start=1.0, denoise_end=1.0, add_noise=0.0, upscale_by=1.0, resize_filter="lanczos", upscale_curve=1.0, tile_size=512, vae=None):
+        image_out = common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sampler_name, scheduler, positive, negative, image, denoise_start=denoise_start, vae=vae, iterations=iterations, denoise_end=denoise_end, upscale_by=upscale_by, resize_filter=resize_filter, upscale_curve=upscale_curve, tile_size=tile_size, add_noise=add_noise)
         
         if image_out is None:
             # Create a black image if everything fails
