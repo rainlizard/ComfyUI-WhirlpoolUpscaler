@@ -1,5 +1,5 @@
-from . import WhirlpoolUpscaler
-from .WhirlpoolUpscaler import WhirlpoolUpscaler
+from . import whirlpoolupscaler
+from .whirlpoolupscaler import WhirlpoolUpscaler
 
 NODE_CLASS_MAPPINGS = {
     "WhirlpoolUpscaler": WhirlpoolUpscaler
