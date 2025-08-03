@@ -6,6 +6,7 @@ import nodes
 import inspect
 import math
 import time
+import comfy_extras.nodes_upscale_model as model_upscale
 
 
 # Use ComfyUI's native sampling only
@@ -118,37 +119,21 @@ def ensure_latent_dict(latent_data):
     return latent_data
 
 def upscale_with_model(upscale_model, image, tile_size=512):
-    """Upscale image using an AI upscale model - equivalent to ImageUpscaleWithModel"""
+    """Upscale image using ComfyUI's ImageUpscaleWithModel - with built-in OOM handling"""
     if PRINT_DEBUG_MESSAGES:
-        print(f"[WhirlpoolUpscaler DEBUG] Model Upscale: input shape {image.shape}, tile_size={tile_size}, model_scale={upscale_model.scale} [{get_debug_time()}ms]")
+        print(f"[WhirlpoolUpscaler DEBUG] Model Upscale: input shape {image.shape}, model_scale={upscale_model.scale} [{get_debug_time()}ms]")
     
-    device = model_management.get_torch_device()
-    upscale_model.to(device)
-    in_img = image.movedim(-1,-3).to(device)
+    # Check for interruption before attempting upscaling
+    if COMFY_INTERRUPT_AVAILABLE:
+        throw_exception_if_processing_interrupted()
     
-    tile = tile_size
-    overlap = 32
-    
-    oom = True
-    while oom:
-        try:
-            steps = in_img.shape[0] * comfy.utils.get_tiled_scale_steps(in_img.shape[3], in_img.shape[2], tile_x=tile, tile_y=tile, overlap=overlap)
-            pbar = comfy.utils.ProgressBar(steps)
-            s = comfy.utils.tiled_scale(in_img, lambda a: upscale_model(a), tile_x=tile, tile_y=tile, overlap=overlap, upscale_amount=upscale_model.scale, pbar=pbar)
-            oom = False
-        except model_management.OOM_EXCEPTION as e:
-            if PRINT_DEBUG_MESSAGES:
-                print(f"[WhirlpoolUpscaler DEBUG] Model Upscale OOM, reducing tile size from {tile} to {tile//2} [{get_debug_time()}ms]")
-            tile //= 2
-            if tile < 128:
-                raise e
-
-    s = torch.clamp(s.movedim(-3,-1), min=0, max=1.0)
+    # Use ComfyUI's built-in ImageUpscaleWithModel with automatic tiling and OOM handling
+    upscaled = model_upscale.ImageUpscaleWithModel().upscale(upscale_model, image)[0]
     
     if PRINT_DEBUG_MESSAGES:
-        print(f"[WhirlpoolUpscaler DEBUG] Model Upscale complete: output shape {s.shape} [{get_debug_time()}ms]")
+        print(f"[WhirlpoolUpscaler DEBUG] Model Upscale complete: output shape {upscaled.shape} [{get_debug_time()}ms]")
     
-    return s
+    return upscaled
 
 def histogram_match_channel(source, reference, bins=256):
     """Match histogram of source channel to reference channel"""
@@ -269,34 +254,41 @@ def latent_upscale_on_pixel_space(samples, resize_filter, w, h, vae, use_tile=Tr
     # Step 1: VAE decode
     pixels = vae_decode_tiled(vae, samples_dict, use_tile, tile_size, overlap)
     
-    # Step 2: Image upscale
+    # Step 2: Image upscale using wlsh_nodes approach - model upscale then resize to factor
     if upscale_model is not None:
-        # Use AI upscaling model first, then resize to exact target dimensions
         target_w = int(w)
         target_h = int(h)
         current_w = pixels.shape[2]
         current_h = pixels.shape[1]
         
-        # Apply model upscaling iteratively until we reach or exceed target size
-        while current_w < target_w or current_h < target_h:
-            pixels = upscale_with_model(upscale_model, pixels, tile_size)
-            new_w = pixels.shape[2]
-            new_h = pixels.shape[1]
-            
-            # Check if model didn't actually upscale (1x model)
-            if new_w == current_w and new_h == current_h:
-                if PRINT_DEBUG_MESSAGES:
-                    print(f"[WhirlpoolUpscaler DEBUG] 1x upscale model detected, breaking upscale loop [{get_debug_time()}ms]")
-                else:
-                    print(f"[WhirlpoolUpscaler] 1x upscale model detected, breaking upscale loop")
-                break
-            
-            current_w = new_w
-            current_h = new_h
+        # Calculate the scale factor needed
+        scale_factor = max(target_w / current_w, target_h / current_h)
         
-        # Resize to exact target dimensions if needed
-        if current_w != target_w or current_h != target_h:
+        # Apply model upscaling once for quality
+        pixels = upscale_with_model(upscale_model, pixels, tile_size)
+        
+        # Check if model actually upscaled (detect 1x models)
+        new_w = pixels.shape[2]
+        new_h = pixels.shape[1]
+        if new_w == current_w and new_h == current_h:
+            if PRINT_DEBUG_MESSAGES:
+                print(f"[WhirlpoolUpscaler DEBUG] 1x upscale model detected, using standard scaling [{get_debug_time()}ms]")
+            # Fall back to standard scaling
             pixels = nodes.ImageScale().upscale(pixels, resize_filter, target_w, target_h, False)[0]
+        else:
+            # Now resize the model-upscaled image to exact target dimensions
+            # Use the scale factor relative to the ORIGINAL size, not the model-upscaled size
+            final_w = int(current_w * scale_factor)
+            final_h = int(current_h * scale_factor)
+            
+            if PRINT_DEBUG_MESSAGES:
+                print(f"[WhirlpoolUpscaler DEBUG] Resizing model output from {new_w}x{new_h} to {final_w}x{final_h} (factor: {scale_factor:.3f}x) [{get_debug_time()}ms]")
+            
+            # Use ComfyUI's common_upscale for the final resize
+            import comfy.utils
+            samples = pixels.movedim(-1, 1)  # Convert to [B, C, H, W] for common_upscale
+            s = comfy.utils.common_upscale(samples, final_w, final_h, resize_filter, crop="disabled")
+            pixels = s.movedim(1, -1)  # Convert back to [B, H, W, C]
     else:
         # Use standard image scaling
         pixels = nodes.ImageScale().upscale(pixels, resize_filter, int(w), int(h), False)[0]
@@ -626,7 +618,7 @@ class WhirlpoolUpscaler:
                 "positive": ("CONDITIONING", ),
                 "negative": ("CONDITIONING", ),
                 "resize_filter": (["lanczos", "nearest-exact", "bilinear", "area", "bicubic"], {"default": "lanczos", "tooltip": "Image resizing filter algorithm."}),
-                "tile_size": ("INT", {"default": 1024, "min": 320, "max": 2048, "step": 64, "tooltip": "Tile size for VAE operations."}),
+                "tile_size": ("INT", {"default": 512, "min": 320, "max": 2048, "step": 64, "tooltip": "Tile size for VAE operations."}),
                 "vae": ("VAE", ),
             },
             "optional": {
