@@ -19,7 +19,7 @@ except ImportError:
     COMFY_INTERRUPT_AVAILABLE = False
 
 # Constants
-PRINT_DEBUG_MESSAGES = True
+PRINT_DEBUG_MESSAGES = False
 LATENT_TO_PIXEL_SCALE = 8
 DEFAULT_OVERLAP = 64
 
@@ -118,7 +118,7 @@ def ensure_latent_dict(latent_data):
         return {"samples": latent_data}
     return latent_data
 
-def upscale_with_model(upscale_model, image, tile_size=512):
+def upscale_with_model(upscale_model, image, upscale_tile_size=512):
     """Upscale image using ComfyUI's ImageUpscaleWithModel - with built-in OOM handling"""
     if PRINT_DEBUG_MESSAGES:
         print(f"[WhirlpoolUpscaler DEBUG] Model Upscale: input shape {image.shape}, model_scale={upscale_model.scale} [{get_debug_time()}ms]")
@@ -463,7 +463,7 @@ def common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sam
         
         # Log iteration information
         if add_noise > 0.0:
-            print(f"[WhirlpoolUpscaler] Iteration {iteration + 1}/{iterations} | Current: {current_width}x{current_height} | Target: {target_width}x{target_height} | Scale: {current_scale:.3f}x | Denoise: {current_denoise:.3f} | Steps: {current_steps} | CFG: {current_cfg:.1f} | Add Noise: {current_noise:.3f} (×{add_noise})")
+            print(f"[WhirlpoolUpscaler] Iteration {iteration + 1}/{iterations} | Current: {current_width}x{current_height} | Target: {target_width}x{target_height} | Scale: {current_scale:.3f}x | Denoise: {current_denoise:.3f} | Steps: {current_steps} | CFG: {current_cfg:.1f} | Add Noise: {current_noise:.3f}")
         else:
             print(f"[WhirlpoolUpscaler] Iteration {iteration + 1}/{iterations} | Current: {current_width}x{current_height} | Target: {target_width}x{target_height} | Scale: {current_scale:.3f}x | Denoise: {current_denoise:.3f} | Steps: {current_steps} | CFG: {current_cfg:.1f}")
         
@@ -603,15 +603,15 @@ class WhirlpoolUpscaler:
                 "model": ("MODEL",),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
                 "upscale_by": ("FLOAT", {"default": 2.00, "min": 0.1, "max": 10000, "step": 0.01, "tooltip": "Final resolution multiplier (e.g., 2.0 = double width and height)."}),
-                "upscale_curve": ("FLOAT", {"default": 1.75, "min": 1.0, "max": 10.0, "step": 0.01, "tooltip": "Progression curve for all parameters (resolution, CFG, steps, denoise). 1.0 = linear progression, >1.0 = exponential progression (higher values = more exponential)."}),
+                "upscale_curve": ("FLOAT", {"default": 2.15, "min": 1.0, "max": 10.0, "step": 0.01, "tooltip": "Progression curve for all parameters (resolution, CFG, steps, denoise). 1.0 = linear progression, >1.0 = exponential progression (higher values = more exponential)."}),
                 "iterations": ("INT", {"default": 4, "min": 0, "max": 20, "tooltip": "Number of complete sampling cycles to perform."}),
-                "steps_start": ("INT", {"default": 24, "min": 1, "max": 10000, "tooltip": "Number of sampling steps for the first iteration."}),
+                "steps_start": ("INT", {"default": 12, "min": 1, "max": 10000, "tooltip": "Number of sampling steps for the first iteration."}),
                 "steps_end": ("INT", {"default": 2, "min": 1, "max": 10000, "tooltip": "Number of sampling steps for the last iteration."}),
                 "cfg_start": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10000.0, "step": 0.1, "round": 0.01, "tooltip": "CFG scale for the first iteration."}),
                 "cfg_end": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10000.0, "step": 0.1, "round": 0.01, "tooltip": "CFG scale for the last iteration."}),
-                "denoise_start": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Denoise strength for the first iteration."}),
+                "denoise_start": ("FLOAT", {"default": 0.20, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Denoise strength for the first iteration."}),
                 "denoise_end": ("FLOAT", {"default": 0.05, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Denoise strength for the last iteration."}),
-                "add_noise": ("FLOAT", {"default": 4.0, "min": 0.0, "max": 100.0, "step": 0.1, "tooltip": "Adds noise before denoising each iteration. The amount added is relative to the current denoise."}),
+                "add_noise": ("FLOAT", {"default": 2.0, "min": 0.0, "max": 100.0, "step": 0.1, "tooltip": "Adds noise before denoising each iteration. The amount added is relative to the current denoise."}),
                 "fix_vae_color": ("BOOLEAN", {"default": True, "tooltip": "Apply color correction after each iteration to maintain color consistency with the original image."}),
                 "sampler_name": (comfy.samplers.KSampler.SAMPLERS, {"default": "euler"}),
                 "scheduler": (comfy.samplers.KSampler.SCHEDULERS, {"default": "simple"}),
