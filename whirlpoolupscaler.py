@@ -118,7 +118,7 @@ def ensure_latent_dict(latent_data):
         return {"samples": latent_data}
     return latent_data
 
-def upscale_with_model(upscale_model, image, upscale_tile_size=512):
+def upscale_with_model(upscale_model, image, upscale_decode_size=512):
     """Upscale image using ComfyUI's ImageUpscaleWithModel - with built-in OOM handling"""
     if PRINT_DEBUG_MESSAGES:
         print(f"[WhirlpoolUpscaler DEBUG] Model Upscale: input shape {image.shape}, model_scale={upscale_model.scale} [{get_debug_time()}ms]")
@@ -207,17 +207,17 @@ def apply_fix_vae_color(current_image, reference_image, num_samples=1000):
     
     return corrected_image
 
-def vae_decode_tiled(vae, samples, use_tile=True, tile_size=512, overlap=DEFAULT_OVERLAP):
+def vae_decode_tiled(vae, samples, use_tile=True, decode_size=512, overlap=DEFAULT_OVERLAP):
     """VAE decode with tiling support"""
     if PRINT_DEBUG_MESSAGES:
-        print(f"[WhirlpoolUpscaler DEBUG] VAE Decode: use_tile={use_tile}, tile_size={tile_size} [{get_debug_time()}ms]")
+        print(f"[WhirlpoolUpscaler DEBUG] VAE Decode: use_tile={use_tile}, decode_size={decode_size} [{get_debug_time()}ms]")
     
     if use_tile:
         decoder = nodes.VAEDecodeTiled()
         if 'overlap' in inspect.signature(decoder.decode).parameters:
-            pixels = decoder.decode(vae, samples, tile_size, overlap=overlap)[0]
+            pixels = decoder.decode(vae, samples, decode_size, overlap=overlap)[0]
         else:
-            pixels = decoder.decode(vae, samples, tile_size)[0]
+            pixels = decoder.decode(vae, samples, decode_size)[0]
     else:
         pixels = nodes.VAEDecode().decode(vae, samples)[0]
     
@@ -226,17 +226,17 @@ def vae_decode_tiled(vae, samples, use_tile=True, tile_size=512, overlap=DEFAULT
     
     return pixels
 
-def vae_encode_tiled(vae, pixels, use_tile=True, tile_size=512, overlap=DEFAULT_OVERLAP):
+def vae_encode_tiled(vae, pixels, use_tile=True, decode_size=512, overlap=DEFAULT_OVERLAP):
     """VAE encode with tiling support"""
     if PRINT_DEBUG_MESSAGES:
-        print(f"[WhirlpoolUpscaler DEBUG] VAE Encode: input shape {pixels.shape}, use_tile={use_tile}, tile_size={tile_size} [{get_debug_time()}ms]")
+        print(f"[WhirlpoolUpscaler DEBUG] VAE Encode: input shape {pixels.shape}, use_tile={use_tile}, decode_size={decode_size} [{get_debug_time()}ms]")
     
     if use_tile:
         encoder = nodes.VAEEncodeTiled()
         if 'overlap' in inspect.signature(encoder.encode).parameters:
-            samples = encoder.encode(vae, pixels, tile_size, overlap=overlap)[0]
+            samples = encoder.encode(vae, pixels, decode_size, overlap=overlap)[0]
         else:
-            samples = encoder.encode(vae, pixels, tile_size)[0]
+            samples = encoder.encode(vae, pixels, decode_size)[0]
     else:
         samples = nodes.VAEEncode().encode(vae, pixels)[0]
     
@@ -246,13 +246,13 @@ def vae_encode_tiled(vae, pixels, use_tile=True, tile_size=512, overlap=DEFAULT_
     
     return samples
 
-def latent_upscale_on_pixel_space(samples, resize_filter, w, h, vae, use_tile=True, tile_size=512, overlap=DEFAULT_OVERLAP, reference_image=None, fix_vae_color_enabled=False, upscale_model=None):
+def latent_upscale_on_pixel_space(samples, resize_filter, w, h, vae, use_tile=True, decode_size=512, overlap=DEFAULT_OVERLAP, upscale_model=None):
     """Latent upscaling via pixel space conversion with optional AI upscale model"""
     # Ensure samples is in the proper format for VAE decode
     samples_dict = ensure_latent_dict(samples)
     
     # Step 1: VAE decode
-    pixels = vae_decode_tiled(vae, samples_dict, use_tile, tile_size, overlap)
+    pixels = vae_decode_tiled(vae, samples_dict, use_tile, decode_size, overlap)
     
     # Step 2: Image upscale using wlsh_nodes approach - model upscale then resize to factor
     if upscale_model is not None:
@@ -265,7 +265,7 @@ def latent_upscale_on_pixel_space(samples, resize_filter, w, h, vae, use_tile=Tr
         scale_factor = max(target_w / current_w, target_h / current_h)
         
         # Apply model upscaling once for quality
-        pixels = upscale_with_model(upscale_model, pixels, tile_size)
+        pixels = upscale_with_model(upscale_model, pixels, decode_size)
         
         # Check if model actually upscaled (detect 1x models)
         new_w = pixels.shape[2]
@@ -293,12 +293,8 @@ def latent_upscale_on_pixel_space(samples, resize_filter, w, h, vae, use_tile=Tr
         # Use standard image scaling
         pixels = nodes.ImageScale().upscale(pixels, resize_filter, int(w), int(h), False)[0]
     
-    # Step 3: Apply color correction if enabled (after upscaling, before VAE encode)
-    if fix_vae_color_enabled and reference_image is not None:
-        pixels = apply_fix_vae_color(pixels, reference_image)
-    
-    # Step 4: VAE encode  
-    upscaled_latent = vae_encode_tiled(vae, pixels, use_tile, tile_size, overlap)
+    # Step 3: VAE encode  
+    upscaled_latent = vae_encode_tiled(vae, pixels, use_tile, decode_size, overlap)
     
     return upscaled_latent, pixels
 
@@ -337,7 +333,7 @@ def lanczos_upscale(image, resize_filter="lanczos", target_height=None, target_w
     return upscaled
 
 
-def common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sampler_name, scheduler, positive, negative, image, denoise_start=1.0, vae=None, iterations=4, denoise_end=0.05, upscale_by=1.0, resize_filter="lanczos", upscale_curve=1.0, tile_size=512, add_noise=0.0, fix_vae_color=False, upscale_model=None):
+def common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sampler_name, scheduler, positive, negative, image, denoise_start=1.0, vae=None, iterations=4, denoise_end=0.05, upscale_by=1.0, resize_filter="lanczos", upscale_curve=1.0, decode_size=512, add_noise=0.0, fix_vae_color=False, upscale_model=None):
     if PRINT_DEBUG_MESSAGES:
         reset_debug_timer()  # Reset timer at start of process
         print(f"[WhirlpoolUpscaler DEBUG] Starting upscaling process: iterations={iterations}, upscale_by={upscale_by}x, steps={steps_start}->{steps_end}, cfg={cfg_start}->{cfg_end}, denoise={denoise_start}->{denoise_end} [{get_debug_time()}ms]")
@@ -437,7 +433,7 @@ def common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sam
     # This preserves the original image characteristics throughout iterations
     if PRINT_DEBUG_MESSAGES:
         print(f"[WhirlpoolUpscaler DEBUG] Encoding original image to latent space [{get_debug_time()}ms]")
-    original_latent = vae_encode_tiled(vae, image, use_tile=True, tile_size=tile_size, overlap=DEFAULT_OVERLAP)
+    original_latent = vae_encode_tiled(vae, image, use_tile=True, decode_size=decode_size, overlap=DEFAULT_OVERLAP)
     current_latent = original_latent
     
     # For color correction tracking - always use original image as reference
@@ -476,8 +472,7 @@ def common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sam
             # STEP 1: Latent upscaling via pixel space
             upscaled_latent, upscaled_pixels = latent_upscale_on_pixel_space(
                 current_latent, resize_filter, target_width, target_height, vae, 
-                use_tile=True, tile_size=tile_size, overlap=DEFAULT_OVERLAP,
-                reference_image=reference_image, fix_vae_color_enabled=fix_vae_color,
+                use_tile=True, decode_size=decode_size, overlap=DEFAULT_OVERLAP,
                 upscale_model=upscale_model
             )
             
@@ -540,10 +535,10 @@ def common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sam
             if iteration == iterations - 1:
                 try:
                     # Try to decode and upscale as last resort
-                    fallback_image = vae_decode_tiled(vae, current_latent, use_tile=True, tile_size=tile_size)
+                    fallback_image = vae_decode_tiled(vae, current_latent, use_tile=True, decode_size=decode_size)
                     fallback_upscaled = lanczos_upscale(fallback_image, resize_filter, target_height=target_height, target_width=target_width)
                     # Re-encode for consistency
-                    current_latent = vae_encode_tiled(vae, fallback_upscaled, use_tile=True, tile_size=tile_size)
+                    current_latent = vae_encode_tiled(vae, fallback_upscaled, use_tile=True, decode_size=decode_size)
                 except KeyboardInterrupt:
                     raise
                 except Exception as final_e:
@@ -564,7 +559,7 @@ def common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sam
     if PRINT_DEBUG_MESSAGES:
         print(f"[WhirlpoolUpscaler DEBUG] Final decode: converting latent to image [{get_debug_time()}ms]")
     try:
-        final_image = vae_decode_tiled(vae, current_latent, use_tile=True, tile_size=tile_size, overlap=DEFAULT_OVERLAP)
+        final_image = vae_decode_tiled(vae, current_latent, use_tile=True, decode_size=decode_size, overlap=DEFAULT_OVERLAP)
         
         # Apply final color correction to the output image
         if fix_vae_color and reference_image is not None:
@@ -603,22 +598,22 @@ class WhirlpoolUpscaler:
                 "model": ("MODEL",),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
                 "upscale_by": ("FLOAT", {"default": 2.00, "min": 0.1, "max": 10000, "step": 0.01, "tooltip": "Final resolution multiplier (e.g., 2.0 = double width and height)."}),
-                "upscale_curve": ("FLOAT", {"default": 2.15, "min": 1.0, "max": 10.0, "step": 0.01, "tooltip": "Progression curve for all parameters (resolution, CFG, steps, denoise). 1.0 = linear progression, >1.0 = exponential progression (higher values = more exponential)."}),
+                "upscale_curve": ("FLOAT", {"default": 3.25, "min": 1.0, "max": 10.0, "step": 0.01, "tooltip": "Progression curve for all parameters (resolution, CFG, steps, denoise). 1.0 = linear progression, >1.0 = exponential progression (higher values = more exponential)."}),
                 "iterations": ("INT", {"default": 4, "min": 0, "max": 20, "tooltip": "Number of complete sampling cycles to perform."}),
                 "steps_start": ("INT", {"default": 12, "min": 1, "max": 10000, "tooltip": "Number of sampling steps for the first iteration."}),
                 "steps_end": ("INT", {"default": 2, "min": 1, "max": 10000, "tooltip": "Number of sampling steps for the last iteration."}),
                 "cfg_start": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10000.0, "step": 0.1, "round": 0.01, "tooltip": "CFG scale for the first iteration."}),
                 "cfg_end": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10000.0, "step": 0.1, "round": 0.01, "tooltip": "CFG scale for the last iteration."}),
-                "denoise_start": ("FLOAT", {"default": 0.20, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Denoise strength for the first iteration."}),
+                "denoise_start": ("FLOAT", {"default": 0.50, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Denoise strength for the first iteration."}),
                 "denoise_end": ("FLOAT", {"default": 0.05, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Denoise strength for the last iteration."}),
-                "add_noise": ("FLOAT", {"default": 2.0, "min": 0.0, "max": 100.0, "step": 0.1, "tooltip": "Adds noise before denoising each iteration. The amount added is relative to the current denoise."}),
+                "add_noise": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 100.0, "step": 0.1, "tooltip": "Adds noise before denoising each iteration. The amount added is relative to the current denoise."}),
                 "fix_vae_color": ("BOOLEAN", {"default": True, "tooltip": "Apply color correction after each iteration to maintain color consistency with the original image."}),
                 "sampler_name": (comfy.samplers.KSampler.SAMPLERS, {"default": "euler"}),
                 "scheduler": (comfy.samplers.KSampler.SCHEDULERS, {"default": "simple"}),
                 "positive": ("CONDITIONING", ),
                 "negative": ("CONDITIONING", ),
-                "resize_filter": (["lanczos", "nearest-exact", "bilinear", "area", "bicubic"], {"default": "lanczos", "tooltip": "Image resizing filter algorithm."}),
-                "tile_size": ("INT", {"default": 512, "min": 320, "max": 2048, "step": 64, "tooltip": "Tile size for VAE operations."}),
+                "resize_filter": (["lanczos", "nearest-exact", "bilinear", "area", "bicubic"], {"default": "area", "tooltip": "Image resizing filter algorithm."}),
+                "decode_size": ("INT", {"default": 512, "min": 320, "max": 2048, "step": 64, "tooltip": "Decode size for VAE operations."}),
                 "vae": ("VAE", ),
             },
             "optional": {
@@ -632,8 +627,8 @@ class WhirlpoolUpscaler:
 
     CATEGORY = "Whirlpool Upscaler"
 
-    def sample(self, model, seed, iterations, steps_start, steps_end, cfg_start, cfg_end, sampler_name, scheduler, positive, negative, image, denoise_start=1.0, denoise_end=1.0, add_noise=0.0, fix_vae_color=False, upscale_by=1.0, resize_filter="lanczos", upscale_curve=1.0, tile_size=512, vae=None, upscale_model=None):
-        image_out = common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sampler_name, scheduler, positive, negative, image, denoise_start=denoise_start, vae=vae, iterations=iterations, denoise_end=denoise_end, upscale_by=upscale_by, resize_filter=resize_filter, upscale_curve=upscale_curve, tile_size=tile_size, add_noise=add_noise, fix_vae_color=fix_vae_color, upscale_model=upscale_model)
+    def sample(self, model, seed, iterations, steps_start, steps_end, cfg_start, cfg_end, sampler_name, scheduler, positive, negative, image, denoise_start=1.0, denoise_end=1.0, add_noise=0.0, fix_vae_color=False, upscale_by=1.0, resize_filter="lanczos", upscale_curve=1.0, decode_size=512, vae=None, upscale_model=None):
+        image_out = common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sampler_name, scheduler, positive, negative, image, denoise_start=denoise_start, vae=vae, iterations=iterations, denoise_end=denoise_end, upscale_by=upscale_by, resize_filter=resize_filter, upscale_curve=upscale_curve, decode_size=decode_size, add_noise=add_noise, fix_vae_color=fix_vae_color, upscale_model=upscale_model)
         
         if image_out is None:
             # Create a black image if everything fails
