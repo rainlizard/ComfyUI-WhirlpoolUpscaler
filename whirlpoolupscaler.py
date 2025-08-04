@@ -167,6 +167,46 @@ def histogram_match_channel(source, reference, bins=256):
     
     return matched
 
+def interpolate_color_profiles(original_image, previous_image, interpolation_factor):
+    """
+    Create an interpolated reference image by blending color profiles between original and previous images.
+    
+    Args:
+        original_image: The original input image
+        previous_image: The previous iteration's result image  
+        interpolation_factor: Float between 0.0 and 1.0 where:
+            - 0.0 = use only original image's color profile
+            - 1.0 = use only previous image's color profile
+            - 0.5 = blend equally between both
+    
+    Returns:
+        Interpolated reference image for color correction
+    """
+    if original_image is None:
+        return previous_image
+    if previous_image is None:
+        return original_image
+    
+    if PRINT_DEBUG_MESSAGES:
+        print(f"[WhirlpoolUpscaler DEBUG] Color Profile Interpolation: factor={interpolation_factor:.3f} [{get_debug_time()}ms]")
+    
+    # Ensure both images are the same size
+    orig_height, orig_width = original_image.shape[1], original_image.shape[2]  
+    prev_height, prev_width = previous_image.shape[1], previous_image.shape[2]
+    
+    # Resize previous image to match original if needed
+    if prev_height != orig_height or prev_width != orig_width:
+        previous_resized = nodes.ImageScale().upscale(previous_image, "lanczos", orig_width, orig_height, crop="disabled")[0]
+    else:
+        previous_resized = previous_image
+    
+    # Interpolate between the two images
+    # This creates a reference that has color characteristics between original and previous
+    interpolated_reference = (1.0 - interpolation_factor) * original_image + interpolation_factor * previous_resized
+    interpolated_reference = torch.clamp(interpolated_reference, 0.0, 1.0)
+    
+    return interpolated_reference
+
 def apply_fix_vae_color(current_image, reference_image, num_samples=1000):
     """
     Apply histogram matching color correction to current_image based on reference_image.
@@ -436,8 +476,8 @@ def common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sam
     original_latent = vae_encode_tiled(vae, image, use_tile=True, decode_size=decode_size, overlap=DEFAULT_OVERLAP)
     current_latent = original_latent
     
-    # For color correction tracking - always use original image as reference
-    reference_image = image if fix_vae_color else None
+    # For color correction tracking - track previous iteration's image as reference
+    previous_iteration_image = None
     
     for iteration in range(iterations):
         current_denoise = denoise_values[iteration]
@@ -476,7 +516,22 @@ def common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sam
                 upscale_model=upscale_model
             )
             
-            # STEP 2: Sampling
+            # STEP 2: Apply color correction if enabled (after upscaling, before sampling)
+            if fix_vae_color:
+                if previous_iteration_image is not None:
+                    # Use 75% original + 25% previous iteration blend throughout
+                    interpolation_factor = 0.25
+                    # Create interpolated reference between original and previous iteration
+                    reference_for_correction = interpolate_color_profiles(image, previous_iteration_image, interpolation_factor)
+                else:
+                    # First iteration: use original image as reference
+                    reference_for_correction = image
+                
+                upscaled_pixels = apply_fix_vae_color(upscaled_pixels, reference_for_correction)
+                # Re-encode the color-corrected pixels
+                upscaled_latent = vae_encode_tiled(vae, upscaled_pixels, use_tile=True, decode_size=decode_size, overlap=DEFAULT_OVERLAP)
+            
+            # STEP 3: Sampling
             
             latent_tensor = extract_latent_tensor(upscaled_latent)
             
@@ -503,8 +558,18 @@ def common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sam
             if PRINT_DEBUG_MESSAGES:
                 print(f"[WhirlpoolUpscaler DEBUG] Sampling complete for iteration {iteration + 1} [{get_debug_time()}ms]")
             
-            # STEP 3: Update current latent for next iteration
+            # STEP 4: Update current latent for next iteration
             current_latent = refined_latent
+            
+            # STEP 5: Update previous iteration image for color correction reference
+            if fix_vae_color and iteration < iterations - 1:  # Don't decode on last iteration (will be done in final decode)
+                try:
+                    # Decode current result to use as reference for next iteration
+                    previous_iteration_image = vae_decode_tiled(vae, refined_latent, use_tile=True, decode_size=decode_size, overlap=DEFAULT_OVERLAP)
+                except Exception as e:
+                    if PRINT_DEBUG_MESSAGES:
+                        print(f"[WhirlpoolUpscaler DEBUG] Failed to decode for reference image: {e} [{get_debug_time()}ms]")
+                    # Keep the previous reference image if decode fails
             
             # Clean up intermediate data
             del upscaled_latent, upscaled_pixels
@@ -561,12 +626,6 @@ def common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sam
     try:
         final_image = vae_decode_tiled(vae, current_latent, use_tile=True, decode_size=decode_size, overlap=DEFAULT_OVERLAP)
         
-        # Apply final color correction to the output image
-        if fix_vae_color and reference_image is not None:
-            if PRINT_DEBUG_MESSAGES:
-                print(f"[WhirlpoolUpscaler DEBUG] Applying final color correction [{get_debug_time()}ms]")
-            final_image = apply_fix_vae_color(final_image, reference_image)
-        
         if PRINT_DEBUG_MESSAGES:
             print(f"[WhirlpoolUpscaler DEBUG] Upscaling process complete: final shape {final_image.shape} [{get_debug_time()}ms]")
         return final_image
@@ -575,10 +634,6 @@ def common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sam
         try:
             # Fallback to simpler decode
             final_image = vae_decode_tiled(vae, current_latent, use_tile=False)
-            
-            # Apply final color correction to fallback image too
-            if fix_vae_color and reference_image is not None:
-                final_image = apply_fix_vae_color(final_image, reference_image)
             
             return final_image
         except Exception as e2:
