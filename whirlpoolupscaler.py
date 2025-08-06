@@ -7,6 +7,9 @@ import inspect
 import math
 import time
 import comfy_extras.nodes_upscale_model as model_upscale
+import cv2
+import numpy as np
+from scipy import ndimage
 
 
 # Use ComfyUI's native sampling only
@@ -45,12 +48,13 @@ def reset_debug_timer():
 #
 # 1. INITIALIZATION PHASE:
 #    - Parse input parameters (iterations, steps, denoise values, upscale_by, etc.)
-#    - Calculate progressive scale factors for each iteration:
-#      * Geometric mode: Each iteration multiplies by (upscale_by)^(1/iterations)
-#      * Simple mode: Linear increment per iteration: 1.0 + ((iteration + 1) * (upscale_by - 1.0) / iterations)
-#    - Calculate progressive denoise values interpolating linearly from denoise_start to denoise_end
-#    - Calculate progressive steps values interpolating linearly from steps_start to steps_end
-#    - Calculate progressive CFG values interpolating linearly from cfg_start to cfg_end
+#    - Calculate progressive scale factors for each iteration using upscale_curve:
+#      * Each iteration scale: 1.0 + curved_t * (upscale_by - 1.0)
+#      * curved_t = t^upscale_curve where t = (iteration + 1) / iterations
+#      * upscale_curve = 1.0: linear progression, >1.0: exponential progression
+#    - Calculate progressive denoise values using upscale_curve from denoise_start to denoise_end
+#    - Calculate progressive steps values using upscale_curve from steps_start to steps_end
+#    - Calculate progressive CFG values using upscale_curve from cfg_start to cfg_end
 #    - Ensure image is in proper format [B, H, W, C]
 #
 # 2. FALLBACK FOR NO VAE:
@@ -70,16 +74,19 @@ def reset_debug_timer():
 #       - Log current iteration info (number, current resolution, target resolution, scale factor, denoise level, steps, CFG)
 #    
 #    B. UPSCALE AND SAMPLE METHOD:
-#       Step 1: Latent upscaling:
+#       Step 1: Latent upscaling via pixel space:
 #         - VAE decode: latent → pixels
-#         - ImageScale: pixels → upscaled_pixels
+#         - Image upscaling: pixels → upscaled_pixels (using ImageScale or AI upscale model)
 #         - VAE encode: upscaled_pixels → upscaled_latent
-#       Step 2: Sampling:
-#         - Use ComfyUI sampling
-#         - Apply denoise value for current iteration
-#       Step 3: Latent update for next iteration
+#       Step 2: Color correction (if enabled):
+#         - Apply LAB histogram color matching to upscaled pixels using original image as reference
+#         - Re-encode color-corrected pixels back to latent space
+#       Step 3: Sampling:
+#         - Add noise if add_noise > 0 (amount = current_denoise * add_noise)
+#         - Use ComfyUI sampling with current iteration's denoise, CFG, and steps
+#       Step 4: Latent update for next iteration
 #    
-#    FINALIZATION: Final VAE decode
+#    FINALIZATION: Final VAE decode with optional color correction
 #
 # 4. ERROR HANDLING:
 #    - Each VAE operation wrapped in try/catch with fallbacks
@@ -88,17 +95,26 @@ def reset_debug_timer():
 #    - Final iteration decode failure: attempts fallback decode without scaling
 #
 # 5. FINAL OUTPUT:
-#    - Returns final decoded image from last iteration
-#    - If all operations fail, returns scaled version of input image
+#    - Final VAE decode: Convert final latent back to image space
+#    - Apply LAB histogram color correction if fix_vae_color is enabled
+#    - Returns final decoded image with optional color correction
+#    - If decode fails: attempts fallback decode without tiling, still applies color correction
+#    - If all operations fail, returns black image at target size
 #
 # PROGRESSION CURVE EXAMPLES (4 iterations, applies to resolution, CFG, steps, denoise):
 # upscale_curve = 1.0 (linear):     Even progression across iterations
-# upscale_curve = 1.27 (geometric): Traditional exponential progression (matches old geometric mode)
+# upscale_curve = 3.25 (default):   Exponential progression with more aggressive early steps
 # upscale_curve > 1.0: Exponential progression (higher values = more exponential)
 # 
-# Resolution example (2.0x rescale):
+# Resolution example (2.0x rescale, 4 iterations):
 # upscale_curve = 1.0:  1.0x → 1.25x → 1.50x → 1.75x → 2.00x (linear)
-# upscale_curve = 1.27: 1.0x → 1.17x → 1.42x → 1.69x → 2.00x (exponential)
+# upscale_curve = 3.25: 1.0x → 1.13x → 1.45x → 1.77x → 2.00x (exponential)
+# 
+# COLOR CORRECTION:
+# - Uses LAB histogram matching for perceptually accurate color transfer
+# - Applied after each iteration's upscaling and after final decode
+# - Always uses original image as reference for color consistency
+# - Transfer strength hardcoded to 1.0 for maximum accuracy
 #
 # MEMORY EFFICIENCY:
 # - Progressive upscaling allows working with smaller images initially
@@ -135,82 +151,147 @@ def upscale_with_model(upscale_model, image, upscale_decode_size=512):
     
     return upscaled
 
-def histogram_match_channel(source, reference, bins=256):
-    """Match histogram of source channel to reference channel"""
-    # Convert to 0-255 range for histogram calculation
-    source_int = (source * 255).clamp(0, 255).long()
-    reference_int = (reference * 255).clamp(0, 255).long()
-    
-    # Calculate histograms
-    source_hist = torch.histc(source_int.float(), bins=bins, min=0, max=255)
-    reference_hist = torch.histc(reference_int.float(), bins=bins, min=0, max=255)
-    
-    # Calculate CDFs (cumulative distribution functions)
-    source_cdf = torch.cumsum(source_hist, dim=0)
-    reference_cdf = torch.cumsum(reference_hist, dim=0)
-    
-    # Normalize CDFs
-    source_cdf = source_cdf / source_cdf[-1]
-    reference_cdf = reference_cdf / reference_cdf[-1]
-    
-    # Create lookup table
-    lookup_table = torch.zeros(256, device=source.device)
-    
-    for i in range(256):
-        # Find the closest CDF value in reference
-        diff = torch.abs(reference_cdf - source_cdf[i])
-        closest_idx = torch.argmin(diff)
-        lookup_table[i] = closest_idx.float()
-    
-    # Apply lookup table
-    matched = lookup_table[source_int] / 255.0
-    
-    return matched
 
-def interpolate_color_profiles(original_image, previous_image, interpolation_factor):
-    """
-    Create an interpolated reference image by blending color profiles between original and previous images.
-    
-    Args:
-        original_image: The original input image
-        previous_image: The previous iteration's result image  
-        interpolation_factor: Float between 0.0 and 1.0 where:
-            - 0.0 = use only original image's color profile
-            - 1.0 = use only previous image's color profile
-            - 0.5 = blend equally between both
-    
-    Returns:
-        Interpolated reference image for color correction
-    """
-    if original_image is None:
-        return previous_image
-    if previous_image is None:
-        return original_image
-    
-    if PRINT_DEBUG_MESSAGES:
-        print(f"[WhirlpoolUpscaler DEBUG] Color Profile Interpolation: factor={interpolation_factor:.3f} [{get_debug_time()}ms]")
-    
-    # Ensure both images are the same size
-    orig_height, orig_width = original_image.shape[1], original_image.shape[2]  
-    prev_height, prev_width = previous_image.shape[1], previous_image.shape[2]
-    
-    # Resize previous image to match original if needed
-    if prev_height != orig_height or prev_width != orig_width:
-        previous_resized = nodes.ImageScale().upscale(previous_image, "lanczos", orig_width, orig_height, crop="disabled")[0]
-    else:
-        previous_resized = previous_image
-    
-    # Interpolate between the two images
-    # This creates a reference that has color characteristics between original and previous
-    interpolated_reference = (1.0 - interpolation_factor) * original_image + interpolation_factor * previous_resized
-    interpolated_reference = torch.clamp(interpolated_reference, 0.0, 1.0)
-    
-    return interpolated_reference
 
-def apply_fix_vae_color(current_image, reference_image, num_samples=1000):
+def rgb_to_lab(rgb):
+    """Convert RGB to LAB color space for better color matching"""
+    # Convert RGB [0,255] to [0,1]
+    rgb_norm = rgb / 255.0
+    
+    # Apply gamma correction (sRGB to linear RGB)
+    mask = rgb_norm > 0.04045
+    rgb_linear = np.where(mask, ((rgb_norm + 0.055) / 1.055) ** 2.4, rgb_norm / 12.92)
+    
+    # RGB to XYZ transformation matrix (sRGB D65)
+    xyz_matrix = np.array([
+        [0.4124564, 0.3575761, 0.1804375],
+        [0.2126729, 0.7151522, 0.0721750],
+        [0.0193339, 0.1191920, 0.9503041]
+    ])
+    
+    # Convert to XYZ
+    xyz = np.dot(rgb_linear, xyz_matrix.T)
+    
+    # XYZ to LAB conversion
+    # D65 illuminant
+    xn, yn, zn = 0.95047, 1.00000, 1.08883
+    
+    fx = xyz[:, :, 0] / xn
+    fy = xyz[:, :, 1] / yn
+    fz = xyz[:, :, 2] / zn
+    
+    # Apply cube root transformation
+    delta = 6.0 / 29.0
+    mask = np.array([fx, fy, fz]) > delta ** 3
+    fx = np.where(mask[0], np.cbrt(fx), (fx / (3 * delta ** 2)) + (4.0 / 29.0))
+    fy = np.where(mask[1], np.cbrt(fy), (fy / (3 * delta ** 2)) + (4.0 / 29.0))
+    fz = np.where(mask[2], np.cbrt(fz), (fz / (3 * delta ** 2)) + (4.0 / 29.0))
+    
+    L = 116 * fy - 16
+    a = 500 * (fx - fy)
+    b = 200 * (fy - fz)
+    
+    return np.stack([L, a, b], axis=-1)
+
+def lab_to_rgb(lab):
+    """Convert LAB to RGB color space"""
+    L, a, b = lab[:, :, 0], lab[:, :, 1], lab[:, :, 2]
+    
+    # LAB to XYZ
+    fy = (L + 16) / 116
+    fx = a / 500 + fy
+    fz = fy - b / 200
+    
+    delta = 6.0 / 29.0
+    
+    # Apply inverse cube root transformation
+    mask_x = fx > delta
+    mask_y = fy > delta
+    mask_z = fz > delta
+    
+    x = np.where(mask_x, fx ** 3, 3 * delta ** 2 * (fx - 4.0 / 29.0))
+    y = np.where(mask_y, fy ** 3, 3 * delta ** 2 * (fy - 4.0 / 29.0))
+    z = np.where(mask_z, fz ** 3, 3 * delta ** 2 * (fz - 4.0 / 29.0))
+    
+    # D65 illuminant
+    xn, yn, zn = 0.95047, 1.00000, 1.08883
+    xyz = np.stack([x * xn, y * yn, z * zn], axis=-1)
+    
+    # XYZ to RGB transformation matrix (sRGB D65)
+    rgb_matrix = np.array([
+        [ 3.2404542, -1.5371385, -0.4985314],
+        [-0.9692660,  1.8760108,  0.0415560],
+        [ 0.0556434, -0.2040259,  1.0572252]
+    ])
+    
+    # Convert to linear RGB
+    rgb_linear = np.dot(xyz, rgb_matrix.T)
+    
+    # Apply gamma correction (linear RGB to sRGB)
+    mask = rgb_linear > 0.0031308
+    # Clamp to avoid invalid values in power operation
+    rgb_linear_safe = np.clip(rgb_linear, 0.0, None)
+    rgb_norm = np.where(mask, 1.055 * (rgb_linear_safe ** (1.0 / 2.4)) - 0.055, 12.92 * rgb_linear_safe)
+    
+    # Convert to [0,255] and clip
+    rgb = np.clip(rgb_norm * 255.0, 0, 255)
+    return rgb.astype(np.uint8)
+
+def lab_histogram_color_transfer(source, reference, sigma=1.2, transfer_strength=1.0):
     """
-    Apply histogram matching color correction to current_image based on reference_image.
-    Matches the color distribution of each RGB channel independently.
+    LAB histogram matching color transfer for accurate color correction.
+    """
+    source_float = source.astype(np.float32)
+    reference_float = reference.astype(np.float32)
+    
+    # Convert to LAB color space
+    source_lab = rgb_to_lab(source_float)
+    reference_lab = rgb_to_lab(reference_float)
+    
+    result_lab = source_lab.copy()
+    
+    # Apply histogram matching in LAB space
+    for channel in range(3):
+        src_channel = source_lab[:, :, channel].flatten()
+        ref_channel = reference_lab[:, :, channel].flatten()
+        
+        # Sort the arrays
+        src_sorted = np.sort(src_channel)
+        ref_sorted = np.sort(ref_channel)
+        
+        # Create mapping from source to reference distribution
+        src_indices = np.searchsorted(src_sorted, src_channel)
+        src_indices = np.clip(src_indices, 0, len(ref_sorted) - 1)
+        
+        # Map source values to reference distribution
+        mapped_channel = ref_sorted[src_indices].reshape(source_lab.shape[:2])
+        
+        # For L channel (luminance), protect very deep darks from crushing
+        if channel == 0:  # L channel only
+            # Create protection mask for very deep darks (L < 10)
+            deep_dark_mask = np.where(source_lab[:, :, channel] < 10, 0.5, 1.0)  # Reduce transfer strength by 50% for very deep darks
+            adaptive_strength = transfer_strength * deep_dark_mask
+            result_lab[:, :, channel] = (1 - adaptive_strength) * source_lab[:, :, channel] + adaptive_strength * mapped_channel
+        else:
+            # Blend with original using transfer strength for A and B channels
+            result_lab[:, :, channel] = (1 - transfer_strength) * source_lab[:, :, channel] + transfer_strength * mapped_channel
+    
+    # Apply Gaussian smoothing to reduce artifacts
+    for channel in range(3):
+        diff = result_lab[:, :, channel] - source_lab[:, :, channel]
+        smooth_diff = ndimage.gaussian_filter(diff, sigma=sigma)
+        result_lab[:, :, channel] = source_lab[:, :, channel] + smooth_diff
+    
+    # Convert back to RGB
+    result = lab_to_rgb(result_lab)
+    
+    # Clip to valid RGB range
+    result = np.clip(result, 0, 255)
+    return result.astype(np.uint8)
+
+def apply_fix_vae_color(current_image, reference_image):
+    """
+    Apply LAB histogram color correction to current_image based on reference_image.
     """
     if reference_image is None:
         return current_image
@@ -229,15 +310,17 @@ def apply_fix_vae_color(current_image, reference_image, num_samples=1000):
     else:
         reference_resized = reference_image
     
-    # Apply histogram matching to each channel independently
-    corrected_image = current_image.clone()
+    # Convert torch tensors to numpy arrays
+    # Convert from [B, H, W, C] to [H, W, C] and scale to 0-255
+    source_np = (current_image[0].cpu().numpy() * 255).astype(np.uint8)
+    reference_np = (reference_resized[0].cpu().numpy() * 255).astype(np.uint8)
     
-    for channel in range(3):
-        source_channel = current_image[0, :, :, channel].flatten()
-        reference_channel = reference_resized[0, :, :, channel].flatten()
-        
-        matched_channel = histogram_match_channel(source_channel, reference_channel)
-        corrected_image[0, :, :, channel] = matched_channel.view(height, width)
+    # Apply LAB histogram color transfer
+    corrected_np = lab_histogram_color_transfer(source_np, reference_np, transfer_strength=0.95)
+    
+    # Convert back to torch tensor and normalize to [0, 1]
+    corrected_tensor = torch.from_numpy(corrected_np.astype(np.float32) / 255.0).to(current_image.device)
+    corrected_image = corrected_tensor.unsqueeze(0)  # Add batch dimension back
     
     # Clamp to valid range [0, 1]
     corrected_image = torch.clamp(corrected_image, 0.0, 1.0)
@@ -476,8 +559,6 @@ def common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sam
     original_latent = vae_encode_tiled(vae, image, use_tile=True, decode_size=decode_size, overlap=DEFAULT_OVERLAP)
     current_latent = original_latent
     
-    # For color correction tracking - track previous iteration's image as reference
-    previous_iteration_image = None
     
     for iteration in range(iterations):
         current_denoise = denoise_values[iteration]
@@ -518,14 +599,8 @@ def common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sam
             
             # STEP 2: Apply color correction if enabled (after upscaling, before sampling)
             if fix_vae_color:
-                if previous_iteration_image is not None:
-                    # Use 75% original + 25% previous iteration blend throughout
-                    interpolation_factor = 0.25
-                    # Create interpolated reference between original and previous iteration
-                    reference_for_correction = interpolate_color_profiles(image, previous_iteration_image, interpolation_factor)
-                else:
-                    # First iteration: use original image as reference
-                    reference_for_correction = image
+                # Always use original image as reference (100% original image)
+                reference_for_correction = image
                 
                 upscaled_pixels = apply_fix_vae_color(upscaled_pixels, reference_for_correction)
                 # Re-encode the color-corrected pixels
@@ -561,15 +636,6 @@ def common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sam
             # STEP 4: Update current latent for next iteration
             current_latent = refined_latent
             
-            # STEP 5: Update previous iteration image for color correction reference
-            if fix_vae_color and iteration < iterations - 1:  # Don't decode on last iteration (will be done in final decode)
-                try:
-                    # Decode current result to use as reference for next iteration
-                    previous_iteration_image = vae_decode_tiled(vae, refined_latent, use_tile=True, decode_size=decode_size, overlap=DEFAULT_OVERLAP)
-                except Exception as e:
-                    if PRINT_DEBUG_MESSAGES:
-                        print(f"[WhirlpoolUpscaler DEBUG] Failed to decode for reference image: {e} [{get_debug_time()}ms]")
-                    # Keep the previous reference image if decode fails
             
             # Clean up intermediate data
             del upscaled_latent, upscaled_pixels
@@ -626,6 +692,12 @@ def common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sam
     try:
         final_image = vae_decode_tiled(vae, current_latent, use_tile=True, decode_size=decode_size, overlap=DEFAULT_OVERLAP)
         
+        # Apply VAE color fix to the final decoded image if enabled
+        if fix_vae_color:
+            if PRINT_DEBUG_MESSAGES:
+                print(f"[WhirlpoolUpscaler DEBUG] Applying VAE color fix to final decode [{get_debug_time()}ms]")
+            final_image = apply_fix_vae_color(final_image, image)
+        
         if PRINT_DEBUG_MESSAGES:
             print(f"[WhirlpoolUpscaler DEBUG] Upscaling process complete: final shape {final_image.shape} [{get_debug_time()}ms]")
         return final_image
@@ -634,6 +706,12 @@ def common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sam
         try:
             # Fallback to simpler decode
             final_image = vae_decode_tiled(vae, current_latent, use_tile=False)
+            
+            # Apply VAE color fix to the fallback decoded image if enabled
+            if fix_vae_color:
+                if PRINT_DEBUG_MESSAGES:
+                    print(f"[WhirlpoolUpscaler DEBUG] Applying VAE color fix to fallback decode [{get_debug_time()}ms]")
+                final_image = apply_fix_vae_color(final_image, image)
             
             return final_image
         except Exception as e2:
