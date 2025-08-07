@@ -266,15 +266,8 @@ def lab_histogram_color_transfer(source, reference, sigma=1.2, transfer_strength
         # Map source values to reference distribution
         mapped_channel = ref_sorted[src_indices].reshape(source_lab.shape[:2])
         
-        # For L channel (luminance), protect very deep darks from crushing
-        if channel == 0:  # L channel only
-            # Create protection mask for very deep darks (L < 10)
-            deep_dark_mask = np.where(source_lab[:, :, channel] < 10, 0.5, 1.0)  # Reduce transfer strength by 50% for very deep darks
-            adaptive_strength = transfer_strength * deep_dark_mask
-            result_lab[:, :, channel] = (1 - adaptive_strength) * source_lab[:, :, channel] + adaptive_strength * mapped_channel
-        else:
-            # Blend with original using transfer strength for A and B channels
-            result_lab[:, :, channel] = (1 - transfer_strength) * source_lab[:, :, channel] + transfer_strength * mapped_channel
+        # Apply histogram mapping directly
+        result_lab[:, :, channel] = mapped_channel
     
     # Apply Gaussian smoothing to reduce artifacts
     for channel in range(3):
@@ -289,7 +282,7 @@ def lab_histogram_color_transfer(source, reference, sigma=1.2, transfer_strength
     result = np.clip(result, 0, 255)
     return result.astype(np.uint8)
 
-def apply_fix_vae_color(current_image, reference_image):
+def apply_fix_vae_color(current_image, reference_image, transfer_strength=1.0):
     """
     Apply LAB histogram color correction to current_image based on reference_image.
     """
@@ -316,7 +309,7 @@ def apply_fix_vae_color(current_image, reference_image):
     reference_np = (reference_resized[0].cpu().numpy() * 255).astype(np.uint8)
     
     # Apply LAB histogram color transfer
-    corrected_np = lab_histogram_color_transfer(source_np, reference_np, transfer_strength=0.95)
+    corrected_np = lab_histogram_color_transfer(source_np, reference_np, transfer_strength=transfer_strength)
     
     # Convert back to torch tensor and normalize to [0, 1]
     corrected_tensor = torch.from_numpy(corrected_np.astype(np.float32) / 255.0).to(current_image.device)
@@ -602,7 +595,10 @@ def common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sam
                 # Always use original image as reference (100% original image)
                 reference_for_correction = image
                 
-                upscaled_pixels = apply_fix_vae_color(upscaled_pixels, reference_for_correction)
+                # Use 100% strength for all iterations (each iteration is a different image)
+                transfer_strength = 1.0
+                
+                upscaled_pixels = apply_fix_vae_color(upscaled_pixels, reference_for_correction, transfer_strength)
                 # Re-encode the color-corrected pixels
                 upscaled_latent = vae_encode_tiled(vae, upscaled_pixels, use_tile=True, decode_size=decode_size, overlap=DEFAULT_OVERLAP)
             
@@ -692,11 +688,11 @@ def common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sam
     try:
         final_image = vae_decode_tiled(vae, current_latent, use_tile=True, decode_size=decode_size, overlap=DEFAULT_OVERLAP)
         
-        # Apply VAE color fix to the final decoded image if enabled
+        # Apply VAE color fix to final decoded image if enabled
         if fix_vae_color:
             if PRINT_DEBUG_MESSAGES:
-                print(f"[WhirlpoolUpscaler DEBUG] Applying VAE color fix to final decode [{get_debug_time()}ms]")
-            final_image = apply_fix_vae_color(final_image, image)
+                print(f"[WhirlpoolUpscaler DEBUG] Applying VAE color fix to final image [{get_debug_time()}ms]")
+            final_image = apply_fix_vae_color(final_image, image, transfer_strength=1.0)
         
         if PRINT_DEBUG_MESSAGES:
             print(f"[WhirlpoolUpscaler DEBUG] Upscaling process complete: final shape {final_image.shape} [{get_debug_time()}ms]")
@@ -707,11 +703,11 @@ def common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sam
             # Fallback to simpler decode
             final_image = vae_decode_tiled(vae, current_latent, use_tile=False)
             
-            # Apply VAE color fix to the fallback decoded image if enabled
+            # Apply VAE color fix to fallback decoded image if enabled
             if fix_vae_color:
                 if PRINT_DEBUG_MESSAGES:
-                    print(f"[WhirlpoolUpscaler DEBUG] Applying VAE color fix to fallback decode [{get_debug_time()}ms]")
-                final_image = apply_fix_vae_color(final_image, image)
+                    print(f"[WhirlpoolUpscaler DEBUG] Applying VAE color fix to fallback image [{get_debug_time()}ms]")
+                final_image = apply_fix_vae_color(final_image, image, transfer_strength=1.0)
             
             return final_image
         except Exception as e2:
