@@ -590,8 +590,8 @@ def common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sam
                 upscale_model=upscale_model
             )
             
-            # STEP 2: Apply color correction if enabled (after upscaling, before sampling)
-            if fix_vae_color:
+            # STEP 2: Apply color correction if enabled (after upscaling, before sampling) - skip on final iteration
+            if fix_vae_color and iteration < iterations - 1:
                 # Always use original image as reference (100% original image)
                 reference_for_correction = image
                 
@@ -682,17 +682,11 @@ def common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sam
                     # Keep current latent as-is
         
 
-    # Final decode: Convert final latent back to image space
+    # Final decode fallback (only reached if final iteration decode failed)
     if PRINT_DEBUG_MESSAGES:
-        print(f"[WhirlpoolUpscaler DEBUG] Final decode: converting latent to image [{get_debug_time()}ms]")
+        print(f"[WhirlpoolUpscaler DEBUG] Final decode fallback: converting latent to image [{get_debug_time()}ms]")
     try:
         final_image = vae_decode_tiled(vae, current_latent, use_tile=True, decode_size=decode_size, overlap=DEFAULT_OVERLAP)
-        
-        # Apply VAE color fix to final decoded image if enabled
-        if fix_vae_color:
-            if PRINT_DEBUG_MESSAGES:
-                print(f"[WhirlpoolUpscaler DEBUG] Applying VAE color fix to final image [{get_debug_time()}ms]")
-            final_image = apply_fix_vae_color(final_image, image, transfer_strength=1.0)
         
         if PRINT_DEBUG_MESSAGES:
             print(f"[WhirlpoolUpscaler DEBUG] Upscaling process complete: final shape {final_image.shape} [{get_debug_time()}ms]")
@@ -702,13 +696,6 @@ def common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sam
         try:
             # Fallback to simpler decode
             final_image = vae_decode_tiled(vae, current_latent, use_tile=False)
-            
-            # Apply VAE color fix to fallback decoded image if enabled
-            if fix_vae_color:
-                if PRINT_DEBUG_MESSAGES:
-                    print(f"[WhirlpoolUpscaler DEBUG] Applying VAE color fix to fallback image [{get_debug_time()}ms]")
-                final_image = apply_fix_vae_color(final_image, image, transfer_strength=1.0)
-            
             return final_image
         except Exception as e2:
             print(f"All decode methods failed: {e2}, returning black image")
@@ -736,7 +723,7 @@ class WhirlpoolUpscaler:
                 "denoise_start": ("FLOAT", {"default": 0.50, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Denoise strength for the first iteration."}),
                 "denoise_end": ("FLOAT", {"default": 0.05, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Denoise strength for the last iteration."}),
                 "add_noise": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 100.0, "step": 0.1, "tooltip": "Adds noise before denoising each iteration. The amount added is relative to the current denoise."}),
-                "fix_vae_color": ("BOOLEAN", {"default": True, "tooltip": "Apply color correction after each iteration to maintain color consistency with the original image."}),
+                "fix_vae_color": ("BOOLEAN", {"default": False, "tooltip": "Apply color correction after each iteration to maintain color consistency with the original image."}),
                 "sampler_name": (comfy.samplers.KSampler.SAMPLERS, {"default": "euler"}),
                 "scheduler": (comfy.samplers.KSampler.SCHEDULERS, {"default": "simple"}),
                 "positive": ("CONDITIONING", ),
