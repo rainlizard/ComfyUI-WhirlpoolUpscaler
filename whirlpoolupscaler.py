@@ -510,7 +510,8 @@ def common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sam
             t = i / (iterations - 1)
             # Apply upscale_curve to the progression
             # upscale_curve = 1.0: linear, >1.0: exponential, <1.0: inverse exponential
-            curved_t = t ** upscale_curve
+            # Reverse the curve to lean towards denoise_end instead of denoise_start
+            curved_t = 1.0 - ((1.0 - t) ** upscale_curve)
             current_denoise = denoise_start + curved_t * (denoise_end - denoise_start)
             denoise_values.append(current_denoise)
     
@@ -524,7 +525,8 @@ def common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sam
             t = i / (iterations - 1)
             # Apply upscale_curve to the progression
             # upscale_curve = 1.0: linear, >1.0: exponential, <1.0: inverse exponential
-            curved_t = t ** upscale_curve
+            # Reverse the curve to lean towards steps_end instead of steps_start
+            curved_t = 1.0 - ((1.0 - t) ** upscale_curve)
             current_steps = int(steps_start + curved_t * (steps_end - steps_start))
             steps_values.append(current_steps)
     
@@ -538,7 +540,8 @@ def common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sam
             t = i / (iterations - 1)
             # Apply upscale_curve to the progression
             # upscale_curve = 1.0: linear, >1.0: exponential, <1.0: inverse exponential
-            curved_t = t ** upscale_curve
+            # Reverse the curve to lean towards cfg_end instead of cfg_start
+            curved_t = 1.0 - ((1.0 - t) ** upscale_curve)
             current_cfg = cfg_start + curved_t * (cfg_end - cfg_start)
             cfg_values.append(current_cfg)
     
@@ -714,22 +717,22 @@ class WhirlpoolUpscaler:
                 "model": ("MODEL",),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
                 "upscale_by": ("FLOAT", {"default": 2.00, "min": 0.1, "max": 10000, "step": 0.01, "tooltip": "Final resolution multiplier (e.g., 2.0 = double width and height)."}),
-                "upscale_curve": ("FLOAT", {"default": 3.25, "min": 1.0, "max": 10.0, "step": 0.01, "tooltip": "Progression curve for all parameters (resolution, CFG, steps, denoise). 1.0 = linear progression, >1.0 = exponential progression (higher values = more exponential)."}),
+                "upscale_curve": ("FLOAT", {"default": 1.00, "min": 0.0, "max": 10.0, "step": 0.01, "tooltip": "Progression curve for all parameters. 1.0 = linear. >1.0: resolution accelerates, CFG/steps/denoise front-loaded. <1.0: resolution front-loaded, CFG/steps/denoise accelerate."}),
                 "iterations": ("INT", {"default": 4, "min": 0, "max": 20, "tooltip": "Number of complete sampling cycles to perform."}),
-                "steps_start": ("INT", {"default": 12, "min": 1, "max": 10000, "tooltip": "Number of sampling steps for the first iteration."}),
-                "steps_end": ("INT", {"default": 2, "min": 1, "max": 10000, "tooltip": "Number of sampling steps for the last iteration."}),
-                "cfg_start": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10000.0, "step": 0.1, "round": 0.01, "tooltip": "CFG scale for the first iteration."}),
+                "steps_start": ("INT", {"default": 17, "min": 1, "max": 10000, "tooltip": "Number of sampling steps for the first iteration."}),
+                "steps_end": ("INT", {"default": 7, "min": 1, "max": 10000, "tooltip": "Number of sampling steps for the last iteration."}),
+                "cfg_start": ("FLOAT", {"default": 7.0, "min": 0.0, "max": 10000.0, "step": 0.1, "round": 0.01, "tooltip": "CFG scale for the first iteration."}),
                 "cfg_end": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10000.0, "step": 0.1, "round": 0.01, "tooltip": "CFG scale for the last iteration."}),
-                "denoise_start": ("FLOAT", {"default": 0.50, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Denoise strength for the first iteration."}),
-                "denoise_end": ("FLOAT", {"default": 0.05, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Denoise strength for the last iteration."}),
+                "denoise_start": ("FLOAT", {"default": 1.00, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Denoise strength for the first iteration."}),
+                "denoise_end": ("FLOAT", {"default": 0.15, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Denoise strength for the last iteration."}),
                 "add_noise": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 100.0, "step": 0.1, "tooltip": "Adds noise before denoising each iteration. The amount added is relative to the current denoise."}),
-                "fix_vae_color": ("BOOLEAN", {"default": False, "tooltip": "Apply color correction after each iteration to maintain color consistency with the original image."}),
-                "sampler_name": (comfy.samplers.KSampler.SAMPLERS, {"default": "euler"}),
-                "scheduler": (comfy.samplers.KSampler.SCHEDULERS, {"default": "simple"}),
+                "fix_vae_color": ("BOOLEAN", {"default": True, "tooltip": "Apply color correction after each iteration to maintain color consistency with the original image."}),
+                "sampler_name": (comfy.samplers.KSampler.SAMPLERS, {"default": "res_2m"}),
+                "scheduler": (comfy.samplers.KSampler.SCHEDULERS, {"default": "bong_tangent"}),
                 "positive": ("CONDITIONING", ),
                 "negative": ("CONDITIONING", ),
-                "resize_filter": (["lanczos", "nearest-exact", "bilinear", "area", "bicubic"], {"default": "area", "tooltip": "Image resizing filter algorithm."}),
-                "decode_size": ("INT", {"default": 512, "min": 320, "max": 2048, "step": 64, "tooltip": "Decode size for VAE operations."}),
+                "resize_filter": (["lanczos", "nearest-exact", "bilinear", "area", "bicubic"], {"default": "lanczos", "tooltip": "Image resizing filter algorithm."}),
+                "decode_size": ("INT", {"default": 1024, "min": 320, "max": 2048, "step": 64, "tooltip": "Decode size for VAE operations."}),
                 "vae": ("VAE", ),
             },
             "optional": {
