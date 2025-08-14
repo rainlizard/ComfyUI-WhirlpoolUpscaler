@@ -4,10 +4,8 @@ import comfy.sample
 from comfy import model_management
 import nodes
 import inspect
-import math
 import time
 import comfy_extras.nodes_upscale_model as model_upscale
-import cv2
 import numpy as np
 from scipy import ndimage
 
@@ -64,41 +62,40 @@ def reset_debug_timer():
 #    - If iterations is 0, returns original image unchanged
 #
 # 3. MULTI-ITERATION LOOP (for iterations > 0 with VAE):
-#    INITIALIZATION: Encode original image to latent space for continuity preservation
 #    For each iteration (0 to iterations-1):
 #    
 #    A. ITERATION SETUP:
 #       - Calculate current denoise value, CFG value, and steps for this iteration (all progressive)
-#       - Extract current latent dimensions and calculate current pixel dimensions
 #       - Calculate target dimensions using pre-computed scale factor for this iteration
 #       - Log current iteration info (number, current resolution, target resolution, scale factor, denoise level, steps, CFG)
 #    
 #    B. UPSCALE AND SAMPLE METHOD:
-#       Step 1: Latent upscaling via pixel space:
-#         - VAE decode: latent → pixels
-#         - Image upscaling: pixels → upscaled_pixels (using ImageScale or AI upscale model)
-#         - VAE encode: upscaled_pixels → upscaled_latent
-#       Step 2: Color correction (if enabled):
-#         - Apply LAB histogram color matching to upscaled pixels using original image as reference
-#         - Re-encode color-corrected pixels back to latent space
-#       Step 3: Sampling:
+#       Step 1: Color correction (if enabled and not final iteration):
+#         - Apply LAB histogram color matching to current image using original image as reference
+#         - Only runs when: fix_vae_color=True AND iteration < iterations-1
+#         - NEVER runs on final iteration (e.g., if iterations=1, never runs; if iterations=3, runs on iterations 1&2 only)
+#       Step 2: Image upscaling in pixel space:
+#         - Upscale current image directly to target resolution using ImageScale (Lanczos/other filters)
+#         - NO initial VAE decode (works directly on pixel images from previous iteration)
+#       Step 3: VAE encode for sampling:
+#         - VAE encode: upscaled_pixels → latent for sampling
+#       Step 4: Sampling:
 #         - Add noise if add_noise > 0 (amount = current_denoise * add_noise)
 #         - Use ComfyUI sampling with current iteration's denoise, CFG, and steps
-#       Step 4: Latent update for next iteration
+#       Step 5: VAE decode for next iteration:
+#         - VAE decode: sampled_latent → pixels for next iteration input
 #    
-#    FINALIZATION: Final VAE decode with optional color correction
+#    RESULT: Each iteration performs exactly 1 VAE decode operation
 #
 # 4. ERROR HANDLING:
 #    - Each VAE operation wrapped in try/catch with fallbacks
 #    - On encode failure: attempts smaller tiles, then creates dummy latent
 #    - On decode failure: attempts smaller tiles, then creates black image
-#    - Final iteration decode failure: attempts fallback decode without scaling
+#    - Iteration failure: continues with current image as fallback
 #
 # 5. FINAL OUTPUT:
-#    - Final VAE decode: Convert final latent back to image space
-#    - Apply LAB histogram color correction if fix_vae_color is enabled
-#    - Returns final decoded image with optional color correction
-#    - If decode fails: attempts fallback decode without tiling, still applies color correction
+#    - Returns the final decoded image from the last iteration
+#    - No additional VAE operations after the main loop
 #    - If all operations fail, returns black image at target size
 #
 # PROGRESSION CURVE EXAMPLES (4 iterations, applies to resolution, CFG, steps, denoise):
@@ -362,58 +359,6 @@ def vae_encode_tiled(vae, pixels, use_tile=True, decode_size=512, overlap=DEFAUL
     
     return samples
 
-def latent_upscale_on_pixel_space(samples, resize_filter, w, h, vae, use_tile=True, decode_size=512, overlap=DEFAULT_OVERLAP, upscale_model=None):
-    """Latent upscaling via pixel space conversion with optional AI upscale model"""
-    # Ensure samples is in the proper format for VAE decode
-    samples_dict = ensure_latent_dict(samples)
-    
-    # Step 1: VAE decode
-    pixels = vae_decode_tiled(vae, samples_dict, use_tile, decode_size, overlap)
-    
-    # Step 2: Image upscale using wlsh_nodes approach - model upscale then resize to factor
-    if upscale_model is not None:
-        target_w = int(w)
-        target_h = int(h)
-        current_w = pixels.shape[2]
-        current_h = pixels.shape[1]
-        
-        # Calculate the scale factor needed
-        scale_factor = max(target_w / current_w, target_h / current_h)
-        
-        # Apply model upscaling once for quality
-        pixels = upscale_with_model(upscale_model, pixels, decode_size)
-        
-        # Check if model actually upscaled (detect 1x models)
-        new_w = pixels.shape[2]
-        new_h = pixels.shape[1]
-        if new_w == current_w and new_h == current_h:
-            if PRINT_DEBUG_MESSAGES:
-                print(f"[WhirlpoolUpscaler DEBUG] 1x upscale model detected, using standard scaling [{get_debug_time()}ms]")
-            # Fall back to standard scaling
-            pixels = nodes.ImageScale().upscale(pixels, resize_filter, target_w, target_h, False)[0]
-        else:
-            # Now resize the model-upscaled image to exact target dimensions
-            # Use the scale factor relative to the ORIGINAL size, not the model-upscaled size
-            final_w = int(current_w * scale_factor)
-            final_h = int(current_h * scale_factor)
-            
-            if PRINT_DEBUG_MESSAGES:
-                print(f"[WhirlpoolUpscaler DEBUG] Resizing model output from {new_w}x{new_h} to {final_w}x{final_h} (factor: {scale_factor:.3f}x) [{get_debug_time()}ms]")
-            
-            # Use ComfyUI's common_upscale for the final resize
-            import comfy.utils
-            samples = pixels.movedim(-1, 1)  # Convert to [B, C, H, W] for common_upscale
-            s = comfy.utils.common_upscale(samples, final_w, final_h, resize_filter, crop="disabled")
-            pixels = s.movedim(1, -1)  # Convert back to [B, H, W, C]
-    else:
-        # Use standard image scaling
-        pixels = nodes.ImageScale().upscale(pixels, resize_filter, int(w), int(h), False)[0]
-    
-    # Step 3: VAE encode  
-    upscaled_latent = vae_encode_tiled(vae, pixels, use_tile, decode_size, overlap)
-    
-    return upscaled_latent, pixels
-
 
 @torch.no_grad()
 def lanczos_upscale(image, resize_filter="lanczos", target_height=None, target_width=None, scale_factor=1.0):
@@ -548,13 +493,8 @@ def common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sam
     
     current_seed = seed
     
-    # Encode original image to latent space once
-    # This preserves the original image characteristics throughout iterations
-    if PRINT_DEBUG_MESSAGES:
-        print(f"[WhirlpoolUpscaler DEBUG] Encoding original image to latent space [{get_debug_time()}ms]")
-    original_latent = vae_encode_tiled(vae, image, use_tile=True, decode_size=decode_size, overlap=DEFAULT_OVERLAP)
-    current_latent = original_latent
-    
+    # Start with the original image for the first iteration
+    current_image = image
     
     for iteration in range(iterations):
         current_denoise = denoise_values[iteration]
@@ -563,13 +503,9 @@ def common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sam
         # Calculate noise as multiplier of current denoise value
         current_noise = current_denoise * add_noise
         
-        # Get current and target resolutions for logging (from latent dimensions)
-        # Extract tensor from latent dict for shape calculation
-        current_latent_tensor = extract_latent_tensor(current_latent)
-        current_latent_height = current_latent_tensor.shape[2]
-        current_latent_width = current_latent_tensor.shape[3]
-        current_height = current_latent_height * LATENT_TO_PIXEL_SCALE
-        current_width = current_latent_width * LATENT_TO_PIXEL_SCALE
+        # Get current and target resolutions for logging (from image dimensions)
+        current_height = current_image.shape[1]
+        current_width = current_image.shape[2]
         current_scale = scale_factors[iteration]
         target_width = int(original_width * current_scale)
         target_height = int(original_height * current_scale)
@@ -581,32 +517,23 @@ def common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sam
             print(f"[WhirlpoolUpscaler] Iteration {iteration + 1}/{iterations} | Current: {current_width}x{current_height} | Target: {target_width}x{target_height} | Scale: {current_scale:.3f}x | Denoise: {current_denoise:.3f} | Steps: {current_steps} | CFG: {current_cfg:.1f}")
         
         try:
-            # Upscale and sample method
-            
             # Memory management
             model_management.soft_empty_cache()
             
-            # STEP 1: Latent upscaling via pixel space
-            upscaled_latent, upscaled_pixels = latent_upscale_on_pixel_space(
-                current_latent, resize_filter, target_width, target_height, vae, 
-                use_tile=True, decode_size=decode_size, overlap=DEFAULT_OVERLAP,
-                upscale_model=upscale_model
-            )
-            
-            # STEP 2: Apply color correction if enabled (after upscaling, before sampling) - skip on final iteration
+            # STEP 1: Apply color correction before upscaling (if enabled and not final iteration)
             if fix_vae_color and iteration < iterations - 1:
-                # Always use original image as reference (100% original image)
-                reference_for_correction = image
-                
-                # Use 100% strength for all iterations (each iteration is a different image)
-                transfer_strength = 1.0
-                
-                upscaled_pixels = apply_fix_vae_color(upscaled_pixels, reference_for_correction, transfer_strength)
-                # Re-encode the color-corrected pixels
-                upscaled_latent = vae_encode_tiled(vae, upscaled_pixels, use_tile=True, decode_size=decode_size, overlap=DEFAULT_OVERLAP)
+                current_image = apply_fix_vae_color(current_image, image, transfer_strength=1.0)
             
-            # STEP 3: Sampling
+            # STEP 2: Upscale current image to target resolution
+            if target_width != current_image.shape[2] or target_height != current_image.shape[1]:
+                upscaled_image = lanczos_upscale(current_image, resize_filter, target_height=target_height, target_width=target_width)
+            else:
+                upscaled_image = current_image
             
+            # STEP 3: Encode to latent space for sampling
+            upscaled_latent = vae_encode_tiled(vae, upscaled_image, use_tile=True, decode_size=decode_size, overlap=DEFAULT_OVERLAP)
+            
+            # STEP 4: Sampling
             latent_tensor = extract_latent_tensor(upscaled_latent)
             
             # Add noise before denoising if noise level > 0
@@ -632,12 +559,10 @@ def common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sam
             if PRINT_DEBUG_MESSAGES:
                 print(f"[WhirlpoolUpscaler DEBUG] Sampling complete for iteration {iteration + 1} [{get_debug_time()}ms]")
             
-            # STEP 4: Update current latent for next iteration
-            current_latent = refined_latent
-            
+            # STEP 5: VAE decode at the end of each iteration to get the output image
+            current_image = vae_decode_tiled(vae, refined_latent, use_tile=True, decode_size=decode_size, overlap=DEFAULT_OVERLAP)
             
             # Clean up intermediate data
-            del upscaled_latent, upscaled_pixels
             model_management.soft_empty_cache()
             
         except KeyboardInterrupt:
@@ -661,52 +586,30 @@ def common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sam
             traceback.print_exc()
             # If iteration fails, continue with current latent (fallback)
             print(f"[WhirlpoolUpscaler] Iteration {iteration + 1} failed, using fallback")
-            # For final iteration, try simple upscaling as fallback
-            if iteration == iterations - 1:
-                try:
-                    # Try to decode and upscale as last resort
-                    fallback_image = vae_decode_tiled(vae, current_latent, use_tile=True, decode_size=decode_size)
-                    fallback_upscaled = lanczos_upscale(fallback_image, resize_filter, target_height=target_height, target_width=target_width)
-                    # Re-encode for consistency
-                    current_latent = vae_encode_tiled(vae, fallback_upscaled, use_tile=True, decode_size=decode_size)
-                except KeyboardInterrupt:
+            # For any iteration failure, use current image as fallback
+            try:
+                # Keep current_image as is for fallback
+                pass
+            except KeyboardInterrupt:
+                raise
+            except Exception as final_e:
+                # Handle ComfyUI interruption in fallback
+                if COMFY_INTERRUPT_AVAILABLE and isinstance(final_e, InterruptProcessingException):
                     raise
-                except Exception as final_e:
-                    # Handle ComfyUI interruption in fallback
-                    if COMFY_INTERRUPT_AVAILABLE and isinstance(final_e, InterruptProcessingException):
-                        raise
-                    
-                    # Check for cancellation in fallback too
-                    if ("interrupted" in str(final_e).lower() or "cancelled" in str(final_e).lower() or
-                        "cancel" in str(final_e).lower()):
-                        raise
-                    
-                    print(f"Final fallback failed: {final_e}")
-                    # Keep current latent as-is
+                
+                # Check for cancellation in fallback too
+                if ("interrupted" in str(final_e).lower() or "cancelled" in str(final_e).lower() or
+                    "cancel" in str(final_e).lower()):
+                    raise
+                
+                print(f"Fallback decode failed: {final_e}")
+                # Create black image as ultimate fallback
+                current_image = torch.zeros((1, target_height, target_width, 3), dtype=torch.float32, device="cpu")
         
-
-    # Final decode fallback (only reached if final iteration decode failed)
+    # Return the final image from the last iteration
     if PRINT_DEBUG_MESSAGES:
-        print(f"[WhirlpoolUpscaler DEBUG] Final decode fallback: converting latent to image [{get_debug_time()}ms]")
-    try:
-        final_image = vae_decode_tiled(vae, current_latent, use_tile=True, decode_size=decode_size, overlap=DEFAULT_OVERLAP)
-        
-        if PRINT_DEBUG_MESSAGES:
-            print(f"[WhirlpoolUpscaler DEBUG] Upscaling process complete: final shape {final_image.shape} [{get_debug_time()}ms]")
-        return final_image
-    except Exception as e:
-        print(f"Final decode failed: {e}, using fallback decode")
-        try:
-            # Fallback to simpler decode
-            final_image = vae_decode_tiled(vae, current_latent, use_tile=False)
-            return final_image
-        except Exception as e2:
-            print(f"All decode methods failed: {e2}, returning black image")
-            # Ultimate fallback - return black image at target size
-            target_scale = scale_factors[-1] if scale_factors else 1.0
-            final_height = int(original_height * target_scale)
-            final_width = int(original_width * target_scale)
-            return torch.zeros((1, final_height, final_width, 3), dtype=torch.float32, device="cpu")
+        print(f"[WhirlpoolUpscaler DEBUG] Upscaling process complete: final shape {current_image.shape} [{get_debug_time()}ms]")
+    return current_image
 
 class WhirlpoolUpscaler:
     @classmethod
