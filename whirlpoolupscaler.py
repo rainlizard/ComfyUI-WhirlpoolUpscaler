@@ -75,7 +75,7 @@ def reset_debug_timer():
 #         - Only runs when: fix_vae_color=True AND iteration < iterations-1
 #         - NEVER runs on final iteration (e.g., if iterations=1, never runs; if iterations=3, runs on iterations 1&2 only)
 #       Step 2: Image upscaling in pixel space:
-#         - Upscale current image directly to target resolution using ImageScale (Lanczos/other filters)
+#         - Upscale current image directly to target resolution using AI upscale model (if provided) or ImageScale (Lanczos/other filters)
 #         - NO initial VAE decode (works directly on pixel images from previous iteration)
 #       Step 3: VAE encode for sampling:
 #         - VAE encode: upscaled_pixels → latent for sampling
@@ -526,7 +526,15 @@ def common_upscaler(model, seed, steps_start, steps_end, cfg_start, cfg_end, sam
             
             # STEP 2: Upscale current image to target resolution
             if target_width != current_image.shape[2] or target_height != current_image.shape[1]:
-                upscaled_image = lanczos_upscale(current_image, resize_filter, target_height=target_height, target_width=target_width)
+                if upscale_model is not None:
+                    # Use AI upscale model if provided
+                    upscaled_image = upscale_with_model(upscale_model, current_image, upscale_decode_size=decode_size)
+                    # If the model upscale doesn't match target dimensions exactly, adjust with traditional scaling
+                    if upscaled_image.shape[1] != target_height or upscaled_image.shape[2] != target_width:
+                        upscaled_image = lanczos_upscale(upscaled_image, resize_filter, target_height=target_height, target_width=target_width)
+                else:
+                    # Fall back to traditional upscaling filters
+                    upscaled_image = lanczos_upscale(current_image, resize_filter, target_height=target_height, target_width=target_width)
             else:
                 upscaled_image = current_image
             
